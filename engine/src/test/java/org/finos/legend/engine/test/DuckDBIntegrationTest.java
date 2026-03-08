@@ -4938,7 +4938,8 @@ class DuckDBIntegrationTest extends AbstractDatabaseTest {
 
     // ========================================
     // Value-Selecting Function Type Preservation
-    // (PCT: testMax_Numbers, testMin_Numbers, testGreatest_Number, testLeast_Number, testMode_Number)
+    // (PCT: testMax_Numbers, testMin_Numbers, testGreatest_Number,
+    // testLeast_Number, testMode_Number)
     // ========================================
 
     @Test
@@ -5012,7 +5013,8 @@ class DuckDBIntegrationTest extends AbstractDatabaseTest {
         assertEquals(3, ((Number) sr.value()).intValue());
     }
 
-    // Regression: stdDev/variance are NOT value-selecting — must NOT match back to input args
+    // Regression: stdDev/variance are NOT value-selecting — must NOT match back to
+    // input args
     @Test
     void testStdDevSample_doesNotMatchInputArgs() throws SQLException {
         // PCT: |[1, 2, 3]->meta::pure::functions::math::stdDevSample()
@@ -5058,8 +5060,10 @@ class DuckDBIntegrationTest extends AbstractDatabaseTest {
 
     @Test
     void testMode_MixedNumericList_returnsDouble() throws SQLException {
-        // PCT: |[3, 2, 3.0, 7.0, 2, 2, 3, 2.0, 2.0]->meta::pure::functions::math::mode()
-        // Mixed Integer+Float list → Pure promotes to Number → result should be Double 2.0
+        // PCT: |[3, 2, 3.0, 7.0, 2, 2, 3, 2.0,
+        // 2.0]->meta::pure::functions::math::mode()
+        // Mixed Integer+Float list → Pure promotes to Number → result should be Double
+        // 2.0
         Result result = queryService.execute(
                 getCompletePureModelWithRuntime(),
                 "|[3, 2, 3.0, 7.0, 2, 2, 3, 2.0, 2.0]->meta::pure::functions::math::mode()",
@@ -5072,7 +5076,8 @@ class DuckDBIntegrationTest extends AbstractDatabaseTest {
 
     @Test
     void testMode_IntegerOnlyList_returnsLong() throws SQLException {
-        // PCT: |[3, 3, 3, 2, 2]->mode() — Integer-only list → result should stay Integer
+        // PCT: |[3, 3, 3, 2, 2]->mode() — Integer-only list → result should stay
+        // Integer
         Result result = queryService.execute(
                 getCompletePureModelWithRuntime(),
                 "|[3, 3, 3, 2, 2]->meta::pure::functions::math::mode()",
@@ -5085,7 +5090,8 @@ class DuckDBIntegrationTest extends AbstractDatabaseTest {
 
     @Test
     void testGreatest_MixedDateTypes_preservesStrictDate() throws SQLException {
-        // PCT: |[%2025-02-09, %2025-04-09, %2025-02-09T01:15:20+0000, %2025-01-10T15:25:30+0000]->greatest()
+        // PCT: |[%2025-02-09, %2025-04-09, %2025-02-09T01:15:20+0000,
+        // %2025-01-10T15:25:30+0000]->greatest()
         // StrictDate %2025-04-09 is greatest, but DuckDB promotes all to TIMESTAMP
         // Result should preserve StrictDate type (no time component)
         Result result = queryService.execute(
@@ -5096,7 +5102,8 @@ class DuckDBIntegrationTest extends AbstractDatabaseTest {
         ScalarResult sr = (ScalarResult) result;
         // The SQL type should indicate DATE (StrictDate), not TIMESTAMP (DateTime)
         assertEquals("DATE", sr.sqlType(),
-                "greatest of mixed dates where StrictDate wins should return DATE type, got: " + sr.sqlType() + " value: " + sr.value());
+                "greatest of mixed dates where StrictDate wins should return DATE type, got: " + sr.sqlType()
+                        + " value: " + sr.value());
     }
 
     @Test
@@ -5124,7 +5131,8 @@ class DuckDBIntegrationTest extends AbstractDatabaseTest {
         assertInstanceOf(ScalarResult.class, result);
         ScalarResult sr = (ScalarResult) result;
         assertEquals("DATE", sr.sqlType(),
-                "least of mixed dates where StrictDate wins should return DATE type, got: " + sr.sqlType() + " value: " + sr.value());
+                "least of mixed dates where StrictDate wins should return DATE type, got: " + sr.sqlType() + " value: "
+                        + sr.value());
     }
 
     @Test
@@ -5139,5 +5147,224 @@ class DuckDBIntegrationTest extends AbstractDatabaseTest {
         ScalarResult sr = (ScalarResult) result;
         assertFalse(sr.value() instanceof Long && ((Long) sr.value()) == 4L,
                 "variance(true) should NOT be matched back to input arg 4");
+    }
+
+    // ==================== PCT Regression Tests ====================
+    // These replicate the exact failing PCT tests to enable debugging.
+    // Root cause: window frame SQL is missing ORDER BY due to ascending/descending
+    // not being recognized when passed as fully-qualified names from the new
+    // parser.
+
+    // --- Common TDS data for all window frame tests ---
+    private static final String WINDOW_FRAME_TDS = """
+            |#TDS
+                p, o, i
+                0, 1, 10
+                0, 2, 20
+                0, 3, 30
+                100, 1, 10
+                100, 2, 30
+                100, 2, 5
+                100, 3, 11
+                100, 3, 120
+                200, 1, 10000
+                200, 1, 200
+                200, 1, 808080
+                200, 2, 33333
+                200, 3, 0
+                200, 3, 4
+                300, 1, 0
+                300, 2, 0
+            #""";
+
+    private String windowFrameQuery(String frameSpec) {
+        return WINDOW_FRAME_TDS + "->meta::pure::functions::relation::extend("
+                + "~p->meta::pure::functions::relation::over("
+                + "[~o->meta::pure::functions::relation::ascending(), "
+                + "~i->meta::pure::functions::relation::ascending()], "
+                + frameSpec + "), "
+                + "~sum_i_Rows:{p: meta::pure::metamodel::relation::Relation<(p:Integer, o:Integer, i:Integer)>[1], "
+                + "w: meta::pure::functions::relation::_Window<(p:Integer, o:Integer, i:Integer)>[1], "
+                + "r: (p:Integer, o:Integer, i:Integer)[1]|$r.i}:y: Integer[*]|$y->plus())";
+    }
+
+    private void assertWindowSQL(String pureQuery) {
+        String sql = generateSql(pureQuery);
+        System.out.println("Window SQL: " + sql);
+        assertTrue(sql.contains("ORDER BY"), "Window SQL must contain ORDER BY, got: " + sql);
+    }
+
+    @Test
+    @DisplayName("PCT Regression: testRows_CurrentRow_NFollowing")
+    void testPCT_testRows_CurrentRow_NFollowing() throws SQLException {
+        String pureQuery = windowFrameQuery("0->meta::pure::functions::relation::rows(1)");
+        assertWindowSQL(pureQuery);
+        var result = executeRelation(pureQuery);
+        assertEquals(16, result.rows().size(), "Should have 16 rows");
+    }
+
+    @Test
+    @DisplayName("PCT Regression: testRows_CurrentRow_UnboundedFollowing")
+    void testPCT_testRows_CurrentRow_UnboundedFollowing() throws SQLException {
+        String pureQuery = windowFrameQuery(
+                "0->meta::pure::functions::relation::rows(meta::pure::functions::relation::unbounded())");
+        assertWindowSQL(pureQuery);
+        var result = executeRelation(pureQuery);
+        assertEquals(16, result.rows().size(), "Should have 16 rows");
+    }
+
+    @Test
+    @DisplayName("PCT Regression: testRows_NFollowing_NFollowing")
+    void testPCT_testRows_NFollowing_NFollowing() throws SQLException {
+        String pureQuery = windowFrameQuery("1->meta::pure::functions::relation::rows(2)");
+        assertWindowSQL(pureQuery);
+        var result = executeRelation(pureQuery);
+        assertEquals(16, result.rows().size(), "Should have 16 rows");
+    }
+
+    @Test
+    @DisplayName("PCT Regression: testRows_NFollowing_UnboundedFollowing")
+    void testPCT_testRows_NFollowing_UnboundedFollowing() throws SQLException {
+        String pureQuery = windowFrameQuery(
+                "1->meta::pure::functions::relation::rows(meta::pure::functions::relation::unbounded())");
+        assertWindowSQL(pureQuery);
+        var result = executeRelation(pureQuery);
+        assertEquals(16, result.rows().size(), "Should have 16 rows");
+    }
+
+    @Test
+    @DisplayName("PCT Regression: testRows_NPreceding_CurrentRow")
+    void testPCT_testRows_NPreceding_CurrentRow() throws SQLException {
+        String pureQuery = windowFrameQuery("meta::pure::functions::relation::rows(-1, 0)");
+        assertWindowSQL(pureQuery);
+        var result = executeRelation(pureQuery);
+        assertEquals(16, result.rows().size(), "Should have 16 rows");
+    }
+
+    @Test
+    @DisplayName("PCT Regression: testRows_NPreceding_NFollowing")
+    void testPCT_testRows_NPreceding_NFollowing() throws SQLException {
+        String pureQuery = windowFrameQuery("meta::pure::functions::relation::rows(-1, 1)");
+        assertWindowSQL(pureQuery);
+        var result = executeRelation(pureQuery);
+        assertEquals(16, result.rows().size(), "Should have 16 rows");
+    }
+
+    @Test
+    @DisplayName("PCT Regression: testRows_NPreceding_NPreceding")
+    void testPCT_testRows_NPreceding_NPreceding() throws SQLException {
+        String pureQuery = windowFrameQuery("meta::pure::functions::relation::rows(-2, -1)");
+        assertWindowSQL(pureQuery);
+        var result = executeRelation(pureQuery);
+        assertEquals(16, result.rows().size(), "Should have 16 rows");
+    }
+
+    @Test
+    @DisplayName("PCT Regression: testRows_NPreceding_UnboundedFollowing")
+    void testPCT_testRows_NPreceding_UnboundedFollowing() throws SQLException {
+        String pureQuery = windowFrameQuery(
+                "meta::pure::functions::relation::rows(-1, meta::pure::functions::relation::unbounded())");
+        assertWindowSQL(pureQuery);
+        var result = executeRelation(pureQuery);
+        assertEquals(16, result.rows().size(), "Should have 16 rows");
+    }
+
+    @Test
+    @DisplayName("PCT Regression: testRows_UnboundedPreceding_CurrentRow")
+    void testPCT_testRows_UnboundedPreceding_CurrentRow() throws SQLException {
+        String pureQuery = windowFrameQuery(
+                "meta::pure::functions::relation::unbounded()->meta::pure::functions::relation::rows(0)");
+        assertWindowSQL(pureQuery);
+        var result = executeRelation(pureQuery);
+        assertEquals(16, result.rows().size(), "Should have 16 rows");
+    }
+
+    @Test
+    @DisplayName("PCT Regression: testRows_UnboundedPreceding_NFollowing")
+    void testPCT_testRows_UnboundedPreceding_NFollowing() throws SQLException {
+        String pureQuery = windowFrameQuery(
+                "meta::pure::functions::relation::unbounded()->meta::pure::functions::relation::rows(1)");
+        assertWindowSQL(pureQuery);
+        var result = executeRelation(pureQuery);
+        assertEquals(16, result.rows().size(), "Should have 16 rows");
+    }
+
+    @Test
+    @DisplayName("PCT Regression: testRows_UnboundedPreceding_NPreceding")
+    void testPCT_testRows_UnboundedPreceding_NPreceding() throws SQLException {
+        String pureQuery = windowFrameQuery(
+                "meta::pure::functions::relation::unbounded()->meta::pure::functions::relation::rows(-1)");
+        assertWindowSQL(pureQuery);
+        var result = executeRelation(pureQuery);
+        assertEquals(16, result.rows().size(), "Should have 16 rows");
+    }
+
+    @Test
+    @DisplayName("PCT Regression: testOLAPWithPartitionAndMultipleOrderWindowMultipleColumns")
+    void testPCT_testOLAPWithPartitionAndMultipleOrderWindowMultipleColumns() throws SQLException {
+        String pureQuery = """
+                |#TDS
+                    id, grp, name, height
+                    1, 2, A, 11
+                    2, 1, B, 12
+                    3, 3, C, 12
+                    4, 3, B, 11
+                    5, 2, B, 13
+                    6, 1, C, 12
+                    7, 3, A, 13
+                    8, 1, B, 14
+                #->meta::pure::functions::relation::extend(~grp->meta::pure::functions::relation::over([~name->meta::pure::functions::relation::ascending(), ~height->meta::pure::functions::relation::ascending()]), ~[newCol:{p: meta::pure::metamodel::relation::Relation<(id:Integer, grp:Integer, name:String, height:Integer)>[1], w: meta::pure::functions::relation::_Window<(id:Integer, grp:Integer, name:String, height:Integer)>[1], r: (id:Integer, grp:Integer, name:String, height:Integer)[1]|$p->meta::pure::functions::relation::lead($r).id},other:{p: meta::pure::metamodel::relation::Relation<(id:Integer, grp:Integer, name:String, height:Integer)>[1], w: meta::pure::functions::relation::_Window<(id:Integer, grp:Integer, name:String, height:Integer)>[1], r: (id:Integer, grp:Integer, name:String, height:Integer)[1]|$p->meta::pure::functions::relation::first($r).name}])
+                """;
+        String sql = generateSql(pureQuery);
+        System.out.println("OLAP Multiple Order SQL: " + sql);
+        assertTrue(sql.contains("ORDER BY"), "OLAP window SQL must contain ORDER BY, got: " + sql);
+        var result = executeRelation(pureQuery);
+        assertEquals(8, result.rows().size(), "Should have 8 rows");
+    }
+
+    @Test
+    @DisplayName("PCT Regression: testOLAPWithPartitionAndMultipleOrderWindowMultipleColumnsWithFilter")
+    void testPCT_testOLAPWithPartitionAndMultipleOrderWindowMultipleColumnsWithFilter() throws SQLException {
+        String pureQuery = """
+                |#TDS
+                    id, grp, name, height
+                    1, 2, A, 11
+                    2, 1, B, 12
+                    3, 3, C, 12
+                    4, 3, B, 11
+                    5, 2, B, 13
+                    6, 1, C, 12
+                    7, 3, A, 13
+                    8, 1, B, 14
+                    9, 1, C, 11
+                    10, 2, D, 11
+                #->meta::pure::functions::relation::extend(~grp->meta::pure::functions::relation::over([~name->meta::pure::functions::relation::ascending(), ~height->meta::pure::functions::relation::ascending()]), ~[newCol:{p: meta::pure::metamodel::relation::Relation<(id:Integer, grp:Integer, name:String, height:Integer)>[1], w: meta::pure::functions::relation::_Window<(id:Integer, grp:Integer, name:String, height:Integer)>[1], r: (id:Integer, grp:Integer, name:String, height:Integer)[1]|$p->meta::pure::functions::relation::lead($r).id},other:{p: meta::pure::metamodel::relation::Relation<(id:Integer, grp:Integer, name:String, height:Integer)>[1], w: meta::pure::functions::relation::_Window<(id:Integer, grp:Integer, name:String, height:Integer)>[1], r: (id:Integer, grp:Integer, name:String, height:Integer)[1]|$p->meta::pure::functions::relation::first($r).name}])
+                """;
+        String sql = generateSql(pureQuery);
+        System.out.println("OLAP Multiple Order+Filter SQL: " + sql);
+        assertTrue(sql.contains("ORDER BY"), "OLAP window SQL must contain ORDER BY, got: " + sql);
+        var result = executeRelation(pureQuery);
+        assertEquals(10, result.rows().size(), "Should have 10 rows");
+    }
+
+    @Test
+    @DisplayName("PCT Regression: test_Extend_Filter_Select_Pivot_GroupBy_Extend_Sort")
+    void testPCT_test_Extend_Filter_Select_Pivot_GroupBy_Extend_Sort() throws SQLException {
+        String pureQuery = """
+                |#TDS
+                    city, country, year, treePlanted
+                    NYC, USA, 2011, 5000
+                    NYC, USA, 2000, 5000
+                    SAN, USA, 2000, 2000
+                    SAN, USA, 2011, 100
+                    LDN, UK, 2011, 3000
+                    SAN, USA, 2011, 2500
+                    NYC, USA, 2012, 12000
+                    NYC, USA, 2012, 3200
+                #->meta::pure::functions::relation::extend(~yr:x: (city:String, country:String, year:Integer, treePlanted:Integer)[1]|$x.year - 2000)->meta::pure::functions::relation::filter(x: (city:String, country:String, year:Integer, treePlanted:Integer, yr:Integer)[1]|$x.yr > 10)->meta::pure::functions::relation::select(~[city, country, year, treePlanted])->meta::pure::functions::relation::pivot(~year, ~newCol:x|$x.treePlanted:y|$y->meta::pure::functions::math::sum())->meta::pure::functions::relation::groupBy(~country, ~['2011__|__newCol':x|$x.'2011__|__newCol':y|$y->meta::pure::functions::math::sum(), '2012__|__newCol':x|$x.'2012__|__newCol':y|$y->meta::pure::functions::math::sum()])->meta::pure::functions::relation::extend(~newCol:x: (country:String, '2011__|__newCol':Integer, '2012__|__newCol':Integer)[1]|$x.country + '_0')->meta::pure::functions::relation::sort(~country->meta::pure::functions::relation::ascending())
+                """;
+        var result = executeRelation(pureQuery);
+        System.out.println("Pivot composition result: " + result.rows());
+        assertEquals(2, result.rows().size(), "Should have 2 rows (UK, USA)");
     }
 }

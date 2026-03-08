@@ -38,6 +38,16 @@ public final class PureParser {
      * @throws PureParseException if parsing fails
      */
     public static PureExpression parse(String query) {
+        // Phase 2: Clean pipeline — CleanAstBuilder → AstAdapter → PureExpression
+        org.finos.legend.pure.dsl.ast.ValueSpecification vs = parseClean(query);
+        return org.finos.legend.pure.dsl.ast.AstAdapter.toOldAst(vs);
+    }
+
+    /**
+     * Parses using the original PureAstBuilder (pre-refactoring path).
+     * Kept for comparison during migration. Will be removed in Phase 3.
+     */
+    public static PureExpression parseLegacy(String query) {
         PureLexer lexer = new PureLexer(CharStreams.fromString(query));
         lexer.removeErrorListeners();
         lexer.addErrorListener(new ErrorListener());
@@ -47,11 +57,53 @@ public final class PureParser {
         parser.removeErrorListeners();
         parser.addErrorListener(new ErrorListener());
 
-        // Use programLine to support both expressions and let statements
         org.finos.legend.pure.dsl.antlr.PureParser.ProgramLineContext tree = parser.programLine();
         PureAstBuilder visitor = new PureAstBuilder();
-        visitor.setInputSource(query); // Enable source text extraction for user function inlining
+        visitor.setInputSource(query);
         return visitor.visit(tree);
+    }
+
+    /**
+     * Parses a Pure query expression using the clean parser pipeline.
+     *
+     * Returns a protocol-aligned
+     * {@link org.finos.legend.pure.dsl.ast.ValueSpecification}
+     * AST with NO semantic dispatch — all function calls are generic
+     * {@link org.finos.legend.pure.dsl.ast.AppliedFunction} nodes.
+     *
+     * @param query The Pure query string
+     * @return The parsed ValueSpecification AST
+     * @throws PureParseException if parsing fails
+     */
+    public static org.finos.legend.pure.dsl.ast.ValueSpecification parseClean(String query) {
+        PureLexer lexer = new PureLexer(CharStreams.fromString(query));
+        lexer.removeErrorListeners();
+        lexer.addErrorListener(new ErrorListener());
+
+        CommonTokenStream tokens = new CommonTokenStream(lexer);
+        org.finos.legend.pure.dsl.antlr.PureParser parser = new org.finos.legend.pure.dsl.antlr.PureParser(tokens);
+        parser.removeErrorListeners();
+        parser.addErrorListener(new ErrorListener());
+
+        org.finos.legend.pure.dsl.antlr.PureParser.ProgramLineContext tree = parser.programLine();
+        org.finos.legend.pure.dsl.ast.CleanAstBuilder visitor = new org.finos.legend.pure.dsl.ast.CleanAstBuilder();
+        visitor.setInputSource(query);
+        return visitor.visit(tree);
+    }
+
+    /**
+     * Parses via the clean pipeline then converts back to old AST via adapter.
+     *
+     * This is the Phase 2 bridge: CleanAstBuilder → AstAdapter → PureExpression.
+     * Used for validation — should produce equivalent results to
+     * {@link #parse(String)}.
+     *
+     * @param query The Pure query string
+     * @return The old PureExpression AST (via adapter)
+     */
+    public static PureExpression parseCleanToOld(String query) {
+        org.finos.legend.pure.dsl.ast.ValueSpecification vs = parseClean(query);
+        return org.finos.legend.pure.dsl.ast.AstAdapter.toOldAst(vs);
     }
 
     /**
