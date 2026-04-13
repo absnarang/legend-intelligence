@@ -13,8 +13,19 @@ Thumbs.db
 # Maven
 dependency-reduced-pom.xml
 
+# Local secrets — never commit
+.env
+
 # Logs
 *.log
 *.wal
 engine/null.wal
 engine/null
+null
+null.wal
+
+# Test artifacts
+*.class
+test_unnest.sql
+TestDuckDBStruct.java
+nlq_changes.readme

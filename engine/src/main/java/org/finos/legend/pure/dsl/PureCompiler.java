@@ -567,7 +567,7 @@ public final class PureCompiler {
                 alias = extractFinalPropertyName(lambda.body());
             }
 
-            if (path != null && path.hasToManyNavigation() && modelContext != null) {
+            if (path != null && path.hasAnyAssociationNavigation() && modelContext != null) {
                 // Association navigation - collect join info and create projection
                 Projection proj = compileAssociationProjection(path, alias, joinInfos, baseTableAlias, baseMapping);
                 projections.add(proj);
@@ -6521,12 +6521,12 @@ public final class PureCompiler {
     }
 
     private Expression compileComparison(ComparisonExpr comp, CompilationContext context) {
-        // Check if left side involves association navigation through to-many
+        // Check if left side involves association navigation (to-many OR to-one)
         AssociationPath leftPath = analyzePropertyPath(comp.left(), context);
 
-        if (leftPath != null && leftPath.hasToManyNavigation() && context.inFilterContext()) {
-            // Generate EXISTS for to-many navigation
-            return compileToManyComparison(leftPath, comp.operator(), comp.right(), context);
+        if (leftPath != null && leftPath.hasAnyAssociationNavigation() && context.inFilterContext()) {
+            // Generate EXISTS for association navigation (works for both to-one and to-many)
+            return compileAssociationComparison(leftPath, comp.operator(), comp.right(), context);
         }
 
         // Standard comparison
@@ -6631,6 +6631,75 @@ public final class PureCompiler {
      * Generates: EXISTS (SELECT 1 FROM T_ADDRESS a WHERE a.PERSON_ID = p.ID AND
      * a.STREET = 'Main St')
      */
+    /**
+     * Compiles a comparison that involves association navigation (to-one or to-many)
+     * into an EXISTS subquery.
+     *
+     * For to-many: $p.addresses.street == 'Main St'
+     * For to-one:  $p.department.deptName == 'Engineering'
+     * Both generate: EXISTS (SELECT 1 FROM T_TARGET sub WHERE sub.FK = p.PK AND sub.COL = 'val')
+     */
+    private Expression compileAssociationComparison(AssociationPath path, ComparisonExpr.Operator op,
+            PureExpression rightExpr, CompilationContext context) {
+        List<NavigationSegment> segments = path.segments();
+        if (segments.isEmpty()) {
+            throw new PureCompileException("Empty association path");
+        }
+
+        // Find the first association navigation segment (to-one or to-many)
+        NavigationSegment assocSegment = null;
+        for (NavigationSegment seg : segments) {
+            if (seg.isAssociationNavigation()) {
+                assocSegment = seg;
+                break;
+            }
+        }
+
+        if (assocSegment == null) {
+            throw new PureCompileException("No association navigation found in path");
+        }
+
+        AssociationNavigation nav = assocSegment.navigation();
+        RelationalMapping targetMapping = assocSegment.targetMapping();
+
+        if (targetMapping == null || nav.join() == null) {
+            throw new PureCompileException("No mapping or join found for association: " + nav.association().name());
+        }
+
+        String targetAlias = "sub" + aliasCounter++;
+        TableNode targetTable = new TableNode(targetMapping.table(), targetAlias);
+
+        Join join = nav.join();
+        String outerColumn = join.getColumnForTable(context.mapping().table().name());
+        String innerColumn = join.getColumnForTable(targetMapping.table().name());
+
+        Expression correlation = ComparisonExpression.equals(
+                ColumnReference.of(targetAlias, innerColumn, targetMapping.table().getColumnType(innerColumn)),
+                ColumnReference.of(context.tableAlias(), outerColumn, context.mapping().table().getColumnType(outerColumn)));
+
+        NavigationSegment finalSegment = segments.getLast();
+        String targetProperty = finalSegment.propertyName();
+        String targetColumn = targetMapping.getColumnForProperty(targetProperty)
+                .orElseThrow(() -> new PureCompileException("No column mapping for property: " + targetProperty));
+
+        Expression left = ColumnReference.of(targetAlias, targetColumn, targetMapping.pureTypeForProperty(targetProperty));
+        Expression right = compileLiteral((LiteralExpr) rightExpr);
+
+        ComparisonExpression.ComparisonOperator sqlOp = switch (op) {
+            case EQUALS -> ComparisonExpression.ComparisonOperator.EQUALS;
+            case NOT_EQUALS -> ComparisonExpression.ComparisonOperator.NOT_EQUALS;
+            case LESS_THAN -> ComparisonExpression.ComparisonOperator.LESS_THAN;
+            case LESS_THAN_OR_EQUALS -> ComparisonExpression.ComparisonOperator.LESS_THAN_OR_EQUALS;
+            case GREATER_THAN -> ComparisonExpression.ComparisonOperator.GREATER_THAN;
+            case GREATER_THAN_OR_EQUALS -> ComparisonExpression.ComparisonOperator.GREATER_THAN_OR_EQUALS;
+        };
+
+        Expression propertyFilter = new ComparisonExpression(left, sqlOp, right);
+        Expression subqueryCondition = LogicalExpression.and(correlation, propertyFilter);
+        FilterNode subquery = new FilterNode(targetTable, subqueryCondition);
+        return ExistsExpression.exists(subquery);
+    }
+
     private Expression compileToManyComparison(AssociationPath path, ComparisonExpr.Operator op,
             PureExpression rightExpr, CompilationContext context) {
         // Build the EXISTS subquery
@@ -7400,6 +7469,11 @@ public final class PureCompiler {
             String baseVariable,
             List<NavigationSegment> segments,
             boolean hasToManyNavigation) {
+
+        /** True if ANY segment is an association navigation (to-one OR to-many). */
+        boolean hasAnyAssociationNavigation() {
+            return segments.stream().anyMatch(NavigationSegment::isAssociationNavigation);
+        }
     }
 
     /**

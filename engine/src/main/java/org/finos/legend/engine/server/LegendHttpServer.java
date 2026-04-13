@@ -4,6 +4,7 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
 import org.finos.legend.engine.execution.BufferedResult;
+import org.finos.legend.engine.plan.ExecutionPlan;
 
 import java.io.*;
 import java.net.InetSocketAddress;
@@ -48,6 +49,9 @@ public class LegendHttpServer {
         server.createContext("/engine/execute", new ExecuteHandler());
         server.createContext("/engine/sql", new ExecuteSqlHandler());
         server.createContext("/engine/diagram", new DiagramHandler());
+
+        // Engine - plan (compile Pure → SQL without executing)
+        server.createContext("/engine/plan", new PlanHandler());
 
         // Health check
         server.createContext("/health", exchange -> {
@@ -249,6 +253,70 @@ public class LegendHttpServer {
     }
 
     /**
+     * Compile Pure code and return the generated SQL without executing.
+     *
+     * Request: { "code": "<model + query>" }
+     * Response: { "success": true, "sql": "SELECT ...", "dialect": "DuckDB" }
+     */
+    private class PlanHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            addCorsHeaders(exchange);
+            if ("OPTIONS".equals(exchange.getRequestMethod())) {
+                exchange.sendResponseHeaders(204, -1);
+                exchange.close();
+                return;
+            }
+            if (!"POST".equals(exchange.getRequestMethod())) {
+                sendResponse(exchange, 405, "{\"error\":\"Method not allowed\"}");
+                return;
+            }
+            try {
+                String body = readBody(exchange);
+                Map<String, Object> request = LegendHttpJson.parseObject(body);
+                String fullSource = LegendHttpJson.getString(request, "code");
+
+                if (fullSource == null || fullSource.isBlank()) {
+                    sendResponse(exchange, 400, "{\"error\":\"Missing 'code' field\"}");
+                    return;
+                }
+
+                String runtimeName = extractRuntimeName(fullSource);
+                if (runtimeName == null) {
+                    sendResponse(exchange, 400, "{\"error\":\"No Runtime definition found in source\"}");
+                    return;
+                }
+
+                String[] parts = separateModelAndQuery(fullSource);
+                String modelSource = parts[0];
+                String query = parts[1];
+
+                if (query == null || query.isBlank()) {
+                    sendResponse(exchange, 400, "{\"error\":\"No query expression found after Runtime definition\"}");
+                    return;
+                }
+
+                ExecutionPlan plan = queryService.compile(modelSource, query, runtimeName);
+                String sql = plan.getDefaultSql();
+
+                Map<String, Object> response = new LinkedHashMap<>();
+                response.put("success", true);
+                response.put("sql", sql);
+                response.put("dialect", "DuckDB");
+
+                sendResponse(exchange, 200, LegendHttpJson.toJson(response));
+
+            } catch (Exception e) {
+                e.printStackTrace();
+                Map<String, Object> response = new LinkedHashMap<>();
+                response.put("success", false);
+                response.put("error", e.getMessage());
+                sendResponse(exchange, 200, LegendHttpJson.toJson(response));
+            }
+        }
+    }
+
+    /**
      * Extract the Runtime name from the Pure source.
      */
     private String extractRuntimeName(String source) {
@@ -402,7 +470,7 @@ public class LegendHttpServer {
     }
 
     public void start() {
-        server.setExecutor(null);
+        server.setExecutor(java.util.concurrent.Executors.newCachedThreadPool());
         server.start();
         System.out.println("Legend HTTP server started on port " + server.getAddress().getPort());
     }

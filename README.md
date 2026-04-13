@@ -1,199 +1,152 @@
-# Legend Lite
+# Legend Intelligence
 
-A clean-room implementation of the FINOS Legend Engine, designed for **100% SQL push-down** execution. Includes an HTTP server for [Studio Lite](https://github.com/neema2/studio-lite) (the frontend) and an **NLQ (Natural Language Query)** pipeline that translates English questions into Pure queries using LLMs.
+> **The reasoning brain: deep dive into the engine powering financial AI**
+
+A clean-room implementation of the FINOS Legend Engine paired with a Natural Language Query (NLQ) pipeline — enabling 100% SQL push-down execution of Pure language queries and LLM-powered translation from English questions to Pure.
+
+---
+
+## What It Does
+
+Write strongly-typed Pure language queries (or just ask in plain English), and this engine compiles them 100% to SQL — no data ever leaves the database into the JVM. Backed by DuckDB or SQLite in-memory for instant, zero-infra execution.
+
+```
+English question
+  → TF-IDF semantic retrieval (SemanticIndex)
+  → Rich compact schema extraction (NlqProfile metadata)
+  → Single LLM call → {"rootClass": "...", "pureQuery": "..."}
+  → Pure syntax validation (self-correcting retry)
+  → Execute against DuckDB
+```
+
+---
 
 ## Modules
 
 | Module | Description |
 |--------|-------------|
-| `engine/` | Pure parser, compiler, SQL generator, DuckDB/SQLite execution, HTTP server |
-| `nlq/` | NLQ-to-Pure pipeline — semantic retrieval, LLM routing, query planning, Pure generation |
-| `pct/` | Pure Compatibility Tests (PCT) against the Legend specification |
+| `engine/` | Pure parser (ANTLR4), compiler, SQL generator, DuckDB/SQLite execution, HTTP server, LSP server |
+| `nlq/` | NLQ pipeline — semantic index (TF-IDF), schema extractor, LLM clients (Anthropic CLI/API, Gemini), single-call pipeline |
+| `pct/` | Pure Compatibility Tests against the FINOS Legend specification |
+
+---
+
+## Supported Pure Operations
+
+`filter` · `project` · `groupBy` · `sort` · `limit` · `extend` · `join` · `asOfJoin` · window functions (`rank`, `lag`, `lead`) · `distinct` · TDS literals · 95+ expression types
+
+---
+
+## HTTP Endpoints
+
+Server runs on `http://localhost:8080` by default.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/engine/execute` | Compile + run a Pure query against DuckDB |
+| `POST` | `/engine/plan` | Compile Pure → SQL only (no execution) |
+| `POST` | `/engine/sql` | Execute raw SQL |
+| `POST` | `/engine/nlq` | English → Pure query via LLM pipeline |
+| `POST` | `/lsp` | LSP protocol (diagnostics, completions, hover) |
+| `GET` | `/health` | Health check |
+
+---
+
+## NLQ Request Format
+
+```json
+{
+  "code": "<full Pure model source>",
+  "question": "show me the top 5 ETFs by AUM",
+  "domain": "ETF",
+  "model": "claude-haiku-4-5"
+}
+```
+
+**LLM providers** (set `LLM_PROVIDER` in `.env`):
+
+| Value | Description |
+|-------|-------------|
+| `anthropic-cli` | `claude -p ...` subprocess — Claude Pro/Max subscription, no API key |
+| `anthropic-api` | Anthropic REST API — requires `ANTHROPIC_API_KEY` |
+| `gemini` | Google Gemini API — requires `GEMINI_API_KEY` |
 
 ---
 
 ## Quick Start
 
-### Prerequisites
-
-- **Java 21+**
-- **Maven 3.9+**
-- **GEMINI_API_KEY** environment variable (required for NLQ features)
-
-### 1. Build
+**Requirements:** Java 21, Maven 3.8+
 
 ```bash
-mvn clean install -DskipTests
+# Build (skip tests for speed)
+JAVA_HOME=/opt/homebrew/opt/openjdk@21 mvn install -DskipTests
+
+# Configure LLM provider
+cp .env.example .env   # then edit LLM_PROVIDER / API keys
+
+# Start server
+./start-nlq.sh > /tmp/legend-server.log 2>&1 &
+
+# Health check
+curl http://localhost:8080/health
+# → {"status":"ok"}
+
+# Run an NLQ query
+curl -X POST http://localhost:8080/engine/nlq \
+  -H 'Content-Type: application/json' \
+  -d '{"code":"...model...", "question":"top 5 ETFs by AUM", "domain":"ETF"}'
 ```
-
-### 2. Start the Backend Server
-
-**Without NLQ** (engine only — LSP, query execution, SQL, diagrams):
-
-```bash
-mvn exec:java -pl engine \
-  -Dexec.mainClass="org.finos.legend.engine.server.LegendHttpServer"
-```
-
-**With NLQ** (adds the `POST /engine/nlq` endpoint):
-
-```bash
-GEMINI_API_KEY=your-key-here \
-mvn exec:java -pl nlq \
-  -Dexec.mainClass="org.finos.legend.engine.nlq.NlqHttpServer"
-```
-
-Both start on **port 8080** by default. Pass a port number as the first argument to override:
-
-```bash
-mvn exec:java -pl nlq \
-  -Dexec.mainClass="org.finos.legend.engine.nlq.NlqHttpServer" \
-  -Dexec.args="9090"
-```
-
-### 3. Start the Frontend
-
-See [studio-lite](https://github.com/neema2/studio-lite) — it connects to `http://localhost:8080` by default.
 
 ---
 
-## HTTP API
+## NLQ Annotations (NlqProfile)
 
-All endpoints are served from the same server on port 8080.
+Decorate your Pure classes with rich metadata that the semantic retrieval and schema extraction layers use to generate accurate queries on the first try:
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `POST` | `/lsp` | LSP JSON-RPC — diagnostics, completions, hover |
-| `POST` | `/engine/execute` | Compile + execute a Pure query against DuckDB |
-| `POST` | `/engine/sql` | Execute raw SQL against a Runtime's connection |
-| `POST` | `/engine/diagram` | Extract class diagram data from Pure model |
-| `POST` | `/engine/nlq` | **NLQ** — translate natural language to Pure query |
-| `GET`  | `/health` | Health check |
-
-### NLQ Endpoint
-
-**Request:**
-
-```json
+```pure
+Class <<nlq::NlqProfile.core>>
+      {nlq::NlqProfile.description = 'An investment fund (ETF or mutual fund)',
+       nlq::NlqProfile.synonyms = 'fund, etf, mutual fund, ticker',
+       nlq::NlqProfile.sampleValues = 'ticker: SPY, QQQ, VTI',
+       nlq::NlqProfile.unit = 'aum: USD millions',
+       nlq::NlqProfile.exampleQuestions = 'Top 5 ETFs by AUM?'} etf::Fund
 {
-  "code": "Class model::Trade { ... } ...",
-  "question": "show me total notional by desk",
-  "domain": "Trading"
+  ticker: String[1];
+  aum: Float[1];
+  assetClass: String[1];
 }
 ```
-
-- `code` — full Pure model source (classes, mappings, connections, runtime)
-- `question` — natural language question
-- `domain` — optional hint to narrow semantic search
-
-**Response:**
-
-```json
-{
-  "success": true,
-  "rootClass": "Trade",
-  "pureQuery": "Trade.all()->project([t|$t.trader.desk.name, t|$t.notional], ['desk', 'notional'])->groupBy([{r|$r.desk}], [{r|$r.notional->sum()}], ['desk', 'totalNotional'])",
-  "queryPlan": "{ ... }",
-  "retrievedClasses": ["Trade", "Trader", "Desk"],
-  "latencyMs": 4200
-}
-```
-
-### Execute Endpoint
-
-**Request:**
-
-```json
-{
-  "code": "Class model::Person { ... }\nDatabase store::DB ( ... )\nMapping ...\nRuntime ...\n\nPerson.all()->filter({p|$p.age > 30})->project({p|$p.firstName})"
-}
-```
-
-The `code` field contains the full Pure source with the query expression appended at the end (after the Runtime definition).
 
 ---
 
-## NLQ Pipeline
+## Build
 
-The NLQ module implements a 4-step pipeline:
+| Dependency | Version |
+|------------|---------|
+| DuckDB | 1.4.4 |
+| SQLite | 3.47.1 |
+| ANTLR4 | 4.13.1 |
+| JUnit 5 | 5.x |
 
-```
-Question ──► Semantic Retrieval ──► LLM Router ──► Query Planner ──► Pure Generator ──► Parse Validation
-                 (TF-IDF)          (root class)    (structured plan)   (Pure syntax)     (PureParser)
-```
-
-1. **Semantic Retrieval** — TF-IDF index over class names, descriptions, and property metadata. Returns top-K candidate classes.
-2. **Semantic Router** — LLM identifies the root class from candidates (with retry on unparsable responses).
-3. **Query Planner** — LLM builds a structured JSON plan (projections, filters, aggregations, sorts).
-4. **Pure Generator** — LLM generates Pure syntax from the plan (with retry on parse failures).
-5. **Parse Validation** — `PureParser.parse()` hard gate rejects syntactically invalid queries.
-
-### Environment Variables
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `GEMINI_API_KEY` | Yes (for NLQ) | — | Google Gemini API key |
-| `LLM_PROVIDER` | No | `gemini` | LLM provider (`gemini`) |
-| `GEMINI_MODEL` | No | `gemini-3-flash-preview` | Gemini model name |
-
-### NLQ Annotations
-
-Pure models can include NLQ metadata via tagged values to improve retrieval and routing:
-
-```
-Profile nlq {
-  tags: [description, synonyms, businessDomain, importance, exampleQuestions, displayName, sampleValues, unit];
-}
-
-Class {nlq.description = 'Daily profit and loss by trader'} model::DailyPnL {
-  {nlq.synonyms = 'PnL, P&L, daily P&L'} totalPnL: Float[1];
-}
-```
+Packaged as a single shaded fat JAR — no external server required.
 
 ---
 
 ## Testing
 
 ```bash
-# All engine tests (~900 tests, ~10s)
+# Engine unit tests (~900 tests)
 mvn test -pl engine
 
-# NLQ eval — sales-trading model (requires GEMINI_API_KEY)
-GEMINI_API_KEY=your-key mvn test -pl nlq -Dtest="NlqFullPipelineEvalTest"
-
-# NLQ eval — CDM model (741 classes, requires GEMINI_API_KEY)
-GEMINI_API_KEY=your-key mvn test -pl nlq -Dtest="NlqCdmEvalTest"
-
-# PCT compatibility tests
+# Pure Compatibility Tests
 mvn test -pl pct
+
+# NLQ evaluation suite
+mvn test -pl nlq -Dtest="NlqFullPipelineEvalTest" -DGEMINI_API_KEY=...
 ```
 
 ---
 
-## Pure Language Quick Reference
+## Related
 
-```
-// Class filter + project
-Trade.all()
-  ->filter({t|$t.status == 'CONFIRMED'})
-  ->project([t|$t.trader.name, t|$t.notional], ['trader', 'notional'])
-
-// GroupBy (always after project)
-Trade.all()
-  ->project([t|$t.trader.desk.name, t|$t.notional], ['desk', 'notional'])
-  ->groupBy([{r|$r.desk}], [{r|$r.notional->sum()}], ['desk', 'totalNotional'])
-
-// Sort + limit
-Trade.all()
-  ->project([t|$t.notional, t|$t.tradeDate], ['notional', 'tradeDate'])
-  ->sort(descending('notional'))
-  ->limit(10)
-```
-
-All queries are translated to native SQL and executed entirely in the database — no data is fetched into the JVM.
-
----
-
-## License
-
-Apache 2.0
+- [legend-groundzero](https://github.com/absnarang/legend-groundzero) — Streamlit playground UI and NLQ demo
