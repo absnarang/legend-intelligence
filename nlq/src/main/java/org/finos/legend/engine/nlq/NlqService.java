@@ -10,220 +10,40 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
- * Three-step NLQ-to-Pure pipeline:
- * 1. Semantic Router — identifies the root class
- * 2. Query Planner — builds a structured query plan
- * 3. Pure Generator — generates valid Pure query syntax
+ * Single-call NLQ-to-Pure pipeline.
  *
- * Each step uses the LLM with focused context from the SemanticIndex.
+ * Collapses the old 3-step (Router → Planner → Generator) into ONE LLM call
+ * that returns {"rootClass": "...", "pureQuery": "..."}.
+ *
+ * Retry on parse failure: passes the failed query + error back so the model
+ * can self-correct without starting from scratch.
  */
 public class NlqService {
 
     private static final int DEFAULT_TOP_K = 15;
+    private static final int MAX_RETRIES    = 2;
 
-    // ==================== Pure Language Reference Prompt ====================
+    // ── Combined system prompt: routing + generation in one shot ──────────────
 
-    private static final String PURE_GENERATOR_PROMPT = """
-            You are a Pure language code generator. Generate a valid Pure query expression.
+    private static final String SYSTEM_PROMPT = """
+            Pure query generator. Given a data model and question, return ONLY:
+            {"rootClass": "pkg::Class", "pureQuery": "pkg::Class.all()->..."}
 
-            ═══════════════════════════════════════════
-            RULE 1: PROJECT FIRST
-            ═══════════════════════════════════════════
-            ALWAYS project columns before applying filters, sort, limit, extend, or distinct.
-            The only exception is a "class filter" that navigates an association (see Rule 2).
+            RULES:
+            - Fully-qualify: etf::Fund not Fund
+            - project() FIRST, then filter/sort/limit/groupBy
+            - project: [f|$f.prop, f|$f.assoc.prop], ['alias', 'alias2'] — camelCase aliases, single quotes
+            - filter after project: ->filter({row|$row.col == 'X'})  — use $row.prop, no getString()
+            - filter before project: ONLY for association: ->filter({h|$h.fund.ticker == 'SPY'})->project(...)
+            - sort: ->sort('col') or ->sort(descending('col'))
+            - limit: ->limit(5)
+            - groupBy: ->groupBy([{r|$r.col}],[{r|$r.val->sum()}],['col','total'])  agg: sum/avg/count/min/max
 
-            Standard pattern:
-              ClassName.all()->project([lambdas], ['colAlias1', 'colAlias2'])->filter(...)->sort(...)->limit(...)
-
-            ═══════════════════════════════════════════
-            RULE 2: CLASS FILTER vs RELATION FILTER
-            ═══════════════════════════════════════════
-            There are TWO kinds of filter:
-
-            (A) Class filter — BEFORE project. ONLY when filtering through an association:
-                Trade.all()->filter({t|$t.counterparty.name == 'Goldman Sachs'})->project(...)
-
-            (B) Relation filter — AFTER project. PREFERRED for simple property filters.
-                Use property access on the row variable (NOT getString/getInteger — those do not exist):
-                Trade.all()->project([t|$t.tradeId, t|$t.status], ['tradeId', 'status'])->filter({row|$row.status == 'NEW'})
-
-            ═══════════════════════════════════════════
-            RULE 3: COLUMN ALIAS CONVENTION
-            ═══════════════════════════════════════════
-            ALWAYS use camelCase property names as column aliases (NO spaces).
-            This ensures relation filters can reference columns via property access.
-              CORRECT: ->project([t|$t.tradeDate, t|$t.notional], ['tradeDate', 'notional'])
-              WRONG:   ->project([t|$t.tradeDate, t|$t.notional], ['Trade Date', 'Notional'])
-
-            ═══════════════════════════════════════════
-            CORE OPERATIONS
-            ═══════════════════════════════════════════
-
-            --- project() ---
-            Project columns from class properties. ALWAYS include relevant columns.
-              Person.all()->project([p|$p.firstName, p|$p.lastName, p|$p.age], ['firstName', 'lastName', 'age'])
-            Navigate associations with dot notation:
-              Trade.all()->project([t|$t.tradeId, t|$t.counterparty.name, t|$t.trader.desk.name], ['tradeId', 'counterparty', 'desk'])
-
-            --- filter() on relation ---
-            After project, filter using property access on the row variable:
-              ->filter({row|$row.age > 30})
-              ->filter({row|$row.status == 'ACTIVE'})
-              ->filter({row|$row.tradeDate >= %2026-01-01})
-              ->filter({row|$row.name->contains('Smith')})
-              ->filter({row|$row.name->startsWith('A')})
-              ->filter({row|$row.amount > 0 && $row.status != 'CANCELLED'})
-
-            --- groupBy() ---
-            Aggregation with 3 arguments: [group lambdas], [agg lambdas], ['column names']
-            IMPORTANT: groupBy() MUST be called after project(), never directly on Class.all().
-            Aggregation lambdas apply the agg function directly: {r|$r.col->sum()}
-              Trade.all()->project([t|$t.trader.desk.name, t|$t.notional], ['desk', 'notional'])->groupBy([{r|$r.desk}], [{r|$r.notional->sum()}], ['desk', 'totalNotional'])
-            Multiple aggregations:
-              Trade.all()->project([t|$t.side, t|$t.notional, t|$t.tradeId], ['side', 'notional', 'tradeId'])->groupBy([{r|$r.side}], [{r|$r.notional->sum()}, {r|$r.tradeId->count()}], ['side', 'totalNotional', 'count'])
-            Available agg functions: sum(), avg(), count(), min(), max(), stdDev(), variance(), median(), mode()
-            Percentile: {r|$r.salary->percentile(0.95, true)}
-
-            --- sort() ---
-            After project:
-              ->sort('columnAlias')              // ascending
-              ->sort(descending('amount'))        // descending
-              ->sort('desk', descending('pnl'))   // multi-column
-
-            --- limit() / take() / drop() / slice() ---
-              ->limit(10)       // first 10 rows
-              ->take(10)        // alias for limit
-              ->drop(5)         // skip first 5 rows (OFFSET)
-              ->slice(10, 20)   // rows 10 through 20
-
-            --- distinct() ---
-              ->distinct()      // deduplicate rows (after project)
-
-            ═══════════════════════════════════════════
-            WINDOW FUNCTIONS
-            ═══════════════════════════════════════════
-            Use extend(over(...), ~colName:{p,w,r|...}) AFTER project:
-
-            Ranking:
-              ->extend(over(), ~rowNum:{p,w,r|$p->rowNumber($r)})
-              ->extend(over(~department, ~salary->desc()), ~rank:{p,w,r|$p->rank($w,$r)})
-              ->extend(over(~department, ~salary->desc()), ~denseRank:{p,w,r|$p->denseRank($w,$r)})
-
-            Value offset:
-              ->extend(over(~department, ~salary->descending()), ~prevSalary:{p,w,r|$p->lag($r).salary})
-              ->extend(over(~department, ~salary->descending()), ~nextSalary:{p,w,r|$p->lead($r).salary})
-
-            Window aggregation:
-              ->extend(over(~department), ~deptTotal:{p,w,r|$p->sum($w,$r).salary})
-
-            Window spec:
-              over()                              — whole result set
-              over(~partitionCol)                  — partition only
-              over(~partitionCol, ~orderCol->desc()) — partition + order
-
-            ═══════════════════════════════════════════
-            COMPUTED COLUMNS (extend without window)
-            ═══════════════════════════════════════════
-              ->extend(~margin:{row|$row.revenue - $row.cost})
-              ->extend(~label:{row|if($row.pnl > 0, |'Profit', |'Loss')})
-
-            ═══════════════════════════════════════════
-            ADDITIONAL OPERATIONS
-            ═══════════════════════════════════════════
-
-            --- rename() ---
-              ->rename(~oldName, ~newName)
-
-            --- concatenate() (UNION) ---
-              relation1->concatenate(relation2)
-
-            --- join() (explicit) ---
-              relation1->join(relation2, JoinKind.INNER, {a,b|$a.id == $b.id})
-              JoinKind options: INNER, LEFT_OUTER
-
-            ═══════════════════════════════════════════
-            SCALAR FUNCTIONS (use in extend or filter)
-            ═══════════════════════════════════════════
-
-            String:  toUpper(), toLower(), length(), trim(),
-                     contains('x'), startsWith('x'), endsWith('x'),
-                     substring(start, end), indexOf('x'), splitPart('delim', n),
-                     format('template %s', [args])
-
-            Math:    round(), floor(), ceiling(), abs(), rem(n), sign()
-
-            Date:    today(), now(),
-                     dateDiff(date1, date2, DurationUnit.DAYS),
-                     adjust(%2026-01-01, 7, DurationUnit.DAYS)
-
-            Conditional: if(cond, |trueVal, |falseVal), coalesce(val1, val2)
-
-            Parse/Cast: parseInteger('123'), parseFloat('1.5'), toString(42)
-
-            ═══════════════════════════════════════════
-            DATE LITERALS
-            ═══════════════════════════════════════════
-              %2026-02-20                    — StrictDate
-              %2026-02-20T14:30:00           — DateTime
-              today()                        — current date
-              now()                          — current timestamp
-              adjust(%2026-02-20, -30, DurationUnit.DAYS) — date arithmetic
-
-            ═══════════════════════════════════════════
-            LET BINDINGS
-            ═══════════════════════════════════════════
-              {|
-                let cutoff = %2026-01-01;
-                Trade.all()->project([t|$t.tradeDate, t|$t.notional], ['tradeDate', 'notional'])
-                  ->filter({row|$row.tradeDate >= $cutoff})
-              }
-
-            ═══════════════════════════════════════════
-            COMPLETE EXAMPLES
-            ═══════════════════════════════════════════
-
-            1. Simple project + relation filter:
-               Person.all()->project([p|$p.firstName, p|$p.age], ['firstName', 'age'])->filter({row|$row.age > 30})
-
-            2. Class filter (association navigation) + project:
-               Trade.all()->filter({t|$t.counterparty.name == 'Goldman Sachs'})->project([t|$t.tradeId, t|$t.notional, t|$t.counterparty.name], ['tradeId', 'notional', 'counterparty'])
-
-            3. GroupBy with class filter:
-               DailyPnL.all()->filter({p|$p.desk.name == 'AMER Equity Swaps'})->project([p|$p.trader.name, p|$p.totalPnL], ['trader', 'totalPnL'])->groupBy([{r|$r.trader}], [{r|$r.totalPnL->sum()}], ['trader', 'totalPnL'])
-
-            4. Project + sort + limit (top N):
-               Trade.all()->project([t|$t.tradeId, t|$t.notional, t|$t.trader.name], ['tradeId', 'notional', 'trader'])->sort(descending('notional'))->limit(10)
-
-            5. Project + window function:
-               Trade.all()->project([t|$t.tradeId, t|$t.trader.desk.name, t|$t.notional], ['tradeId', 'desk', 'notional'])->extend(over(~desk, ~notional->desc()), ~rank:{p,w,r|$p->rank($w,$r)})
-
-            6. Project + relation filter + sort:
-               Trade.all()->project([t|$t.tradeId, t|$t.tradeDate, t|$t.status, t|$t.notional], ['tradeId', 'tradeDate', 'status', 'notional'])->filter({row|$row.tradeDate == today()})->sort(descending('notional'))
-
-            7. GroupBy + relation filter on aggregate:
-               Trade.all()->project([t|$t.trader.name, t|$t.notional], ['trader', 'notional'])->groupBy([{r|$r.trader}], [{r|$r.notional->sum()}], ['trader', 'totalNotional'])->filter({row|$row.totalNotional > 1000000})->sort(descending('totalNotional'))
-
-            8. Complex: class filter + project + groupBy + sort + limit:
-               DailyPnL.all()->filter({p|$p.desk.name == 'AMER Equity Swaps' && $p.pnlDate >= %2026-01-01})->project([p|$p.trader.name, p|$p.totalPnL], ['trader', 'totalPnL'])->groupBy([{r|$r.trader}], [{r|$r.totalPnL->sum()}, {r|$r.totalPnL->count()}], ['trader', 'totalPnL', 'days'])->sort(descending('totalPnL'))->limit(10)
-
-            ═══════════════════════════════════════════
-            KEY RULES
-            ═══════════════════════════════════════════
-            - Always start with ClassName.all()
-            - ALWAYS project() before filter/sort/limit/extend/distinct/groupBy
-            - Column aliases MUST be camelCase with NO spaces (e.g., 'tradeDate' not 'Trade Date')
-            - Class filter ONLY for association navigation; everything else is relation filter
-            - Relation filter uses property access: $row.colName (NOT getString/getInteger — those do not exist)
-            - Use $variable references inside lambdas (e.g., $p, $row, $x)
-            - Date literals: %YYYY-MM-DD or %YYYY-MM-DDThh:mm:ss
-            - Navigate associations via dot notation (e.g., $t.trader.desk.name)
-            - groupBy takes 3 args: [group lambdas], [agg lambdas], ['column names'] — agg lambdas use {r|$r.col->sum()}, NOT agg()
-            - extend() for window functions always comes AFTER project()
-
-            Return ONLY the Pure query expression. No explanation, no markdown, no code fences.
+            EXAMPLES:
+            {"rootClass":"etf::Fund","pureQuery":"etf::Fund.all()->project([f|$f.ticker,f|$f.aum],['ticker','aum'])->filter({row|$row.aum>100000})->sort(descending('aum'))->limit(5)"}
+            {"rootClass":"etf::Holding","pureQuery":"etf::Holding.all()->filter({h|$h.fund.ticker=='SPY'})->project([h|$h.security.ticker,h|$h.weight],['sec','weight'])->sort(descending('weight'))"}
+            {"rootClass":"etf::Holding","pureQuery":"etf::Holding.all()->filter({h|$h.security.ticker=='AAPL'})->project([h|$h.fund.ticker,h|$h.marketValue],['fund','mv'])->groupBy([{r|$r.fund}],[{r|$r.mv->sum()}],['fund','total'])"}
             """;
-
-    private static final int MAX_RETRIES = 2;
 
     private final SemanticIndex index;
     private final PureModelBuilder modelBuilder;
@@ -236,17 +56,13 @@ public class NlqService {
     }
 
     /**
-     * Runs the full NLQ-to-Pure pipeline.
-     *
-     * @param question The natural language question
-     * @param domain   Optional domain hint (e.g., "PnL", "Trading")
-     * @return The NlqResult with the generated Pure query
+     * Runs the single-call NLQ-to-Pure pipeline.
      */
     public NlqResult process(String question, String domain) {
         long start = System.nanoTime();
 
         try {
-            // Step 0: Retrieve relevant classes
+            // Retrieve relevant classes via TF-IDF semantic index
             List<SemanticIndex.RetrievalResult> retrieved = index.retrieve(question, DEFAULT_TOP_K, domain);
             Set<String> classNames = retrieved.stream()
                     .map(SemanticIndex.RetrievalResult::qualifiedName)
@@ -255,47 +71,70 @@ public class NlqService {
                     .map(r -> simpleName(r.qualifiedName()))
                     .toList();
 
-            String routerSchema = ModelSchemaExtractor.extractPrimarySchema(classNames, modelBuilder);
-            String routingHints = ModelSchemaExtractor.extractRoutingHints(classNames, modelBuilder);
+            // Extract focused schema for context (rich compact format leverages NlqProfile metadata)
+            String schema = ModelSchemaExtractor.extractRichCompactSchema(classNames, modelBuilder);
 
-            // Step 1: Semantic Router — identify root class
-            String rootClass = routeToRootClass(question, routerSchema, routingHints);
+            // Build user message
+            String baseMessage = buildMessage(question, schema, null, null);
 
-            // Step 2+3: Rebuild a focused schema around the root class for planner/generator.
-            // The router needed all 15 candidates; planner/generator only need root + its associations.
-            String focusedSchema = ModelSchemaExtractor.extractSchema(Set.of(rootClass), modelBuilder);
-
-            // Step 2: Query Planner — build structured plan
-            String queryPlan = planQuery(question, rootClass, focusedSchema);
-
-            // Step 3: Pure Generator — generate Pure syntax (with parse-retry)
+            String rootClass = null;
             String pureQuery = null;
             Exception lastParseError = null;
+
             for (int attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-                pureQuery = generatePure(question, rootClass, queryPlan, focusedSchema);
+                String message = (attempt == 0)
+                        ? baseMessage
+                        : buildRetryMessage(question, schema, pureQuery, lastParseError);
+
+                long t0 = System.nanoTime();
+                String response = llmClient.complete(SYSTEM_PROMPT, message);
+                long callMs = (System.nanoTime() - t0) / 1_000_000;
+                System.out.printf("  [NlqService] attempt=%d llmCall=%dms%n", attempt, callMs);
+                System.out.flush();
+
+                // Parse JSON response
+                try {
+                    rootClass = extractJsonField(response, "rootClass");
+                    pureQuery = extractPureQuery(response);
+                } catch (Exception e) {
+                    System.out.printf("  [NlqService] JSON parse error (attempt %d): %s%n", attempt, e.getMessage());
+                    System.out.flush();
+                    lastParseError = e;
+                    continue;
+                }
+
+                // Validate Pure syntax
                 try {
                     PureParser.parse(pureQuery);
                     lastParseError = null;
-                    break;
+                    break; // success
                 } catch (Exception e) {
                     lastParseError = e;
-                    if (attempt < MAX_RETRIES) {
-                        System.out.printf("  [retry] parse failed (attempt %d/%d): %s%n",
-                                attempt + 1, MAX_RETRIES + 1, e.getMessage());
-                    }
+                    System.out.printf("  [NlqService] Pure parse error (attempt %d/%d): %s%n",
+                            attempt + 1, MAX_RETRIES + 1, e.getMessage());
+                    System.out.flush();
                 }
-            }
-            if (lastParseError != null) {
-                long elapsed = (System.nanoTime() - start) / 1_000_000;
-                return NlqResult.error("Parse validation failed after " + (MAX_RETRIES + 1) +
-                        " attempts: " + lastParseError.getMessage(), retrievedList, elapsed);
             }
 
             long elapsed = (System.nanoTime() - start) / 1_000_000;
 
+            if (lastParseError != null) {
+                // Return the query anyway with a validation warning (still useful)
+                return new NlqResult(
+                        rootClass != null ? rootClass : "unknown",
+                        null,
+                        pureQuery != null ? pureQuery : "",
+                        "Query generated but failed Pure validation",
+                        false,
+                        "Pure validation: " + lastParseError.getMessage(),
+                        retrievedList,
+                        elapsed
+                );
+            }
+
             return new NlqResult(
                     rootClass,
-                    queryPlan,
+                    null,
                     pureQuery,
                     "Generated Pure query for " + rootClass,
                     true,
@@ -303,134 +142,84 @@ public class NlqService {
                     retrievedList,
                     elapsed
             );
+
         } catch (Exception e) {
             long elapsed = (System.nanoTime() - start) / 1_000_000;
             return NlqResult.error(e.getMessage(), List.of(), elapsed);
         }
     }
 
-    // ==================== Step 1: Semantic Router ====================
+    // ── Message builders ─────────────────────────────────────────────────────
 
-    private String routeToRootClass(String question, String schema, String routingHints) {
-        String systemPrompt = """
-                You are a data model expert. Given a data model schema and a natural language question,
-                identify which class is the PRIMARY entity (root class) that the query should start from.
-                
-                The root class is the main entity being queried — the one that appears after ".all()" in a Pure query.
-                
-                KEY RULES:
-                - Prefer the most SPECIFIC class that directly holds the data being asked about.
-                - If a detail/child class exists for the concept, prefer it over the parent.
-                - Look for "When to use" hints in the routing hints section — they disambiguate similar classes.
-                - The root class should be the one whose properties you'd filter/aggregate on.
-                - When in doubt, choose the class that has the columns you'd want to project or aggregate.
-                
-                Return ONLY a JSON object with this exact format (no markdown, no explanation):
-                {"rootClass": "ClassName", "reasoning": "brief explanation"}
-                """;
+    private static String buildMessage(String question, String schema,
+                                       String failedQuery, Exception parseError) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("Data Model:\n").append(schema);
+        sb.append("\nQuestion: ").append(question);
+        return sb.toString();
+    }
 
-        StringBuilder userMessage = new StringBuilder();
-        userMessage.append("Data Model:\n").append(schema);
-        if (routingHints != null && !routingHints.isBlank()) {
-            userMessage.append("\n\nRouting Hints:\n").append(routingHints);
-        }
-        userMessage.append("\n\nQuestion: ").append(question);
-
-        Exception lastError = null;
-        for (int attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-            String response = llmClient.complete(systemPrompt, userMessage.toString());
-            try {
-                return extractJsonField(response, "rootClass");
-            } catch (Exception e) {
-                lastError = e;
-                if (attempt < MAX_RETRIES) {
-                    System.out.printf("  [retry] rootClass extraction failed (attempt %d/%d): %s%n",
-                            attempt + 1, MAX_RETRIES + 1, e.getMessage());
-                }
+    private static String buildRetryMessage(String question, String schema,
+                                             String failedQuery, Exception parseError) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("Data Model:\n").append(schema);
+        sb.append("\nQuestion: ").append(question);
+        if (failedQuery != null) {
+            sb.append("\n\nPrevious attempt failed Pure validation. Fix the query.\nFailed query:\n").append(failedQuery);
+            if (parseError != null) {
+                sb.append("\nParse error: ").append(parseError.getMessage());
             }
+            sb.append("\n\nReturn corrected JSON: {\"rootClass\": \"...\", \"pureQuery\": \"...\"}");
         }
-        throw new LlmClient.LlmException(
-                "Could not extract rootClass after " + (MAX_RETRIES + 1) + " attempts: " + lastError.getMessage(),
-                -1, lastError.getMessage());
+        return sb.toString();
     }
 
-    // ==================== Step 2: Query Planner ====================
-
-    private String planQuery(String question, String rootClass, String schema) {
-        String systemPrompt = """
-                You are a Pure language query planner. Given a data model, a root class, and a natural language question,
-                produce a structured query plan as JSON.
-                
-                IMPORTANT: The first step should ALWAYS be projections — decide which columns to output.
-                Then apply filters, aggregations, sorting, etc. on the projected relation.
-                
-                The plan should specify:
-                - projections: list of property paths to select (REQUIRED, always first)
-                - classFilters: list of filters that require association navigation (BEFORE project)
-                - relationFilters: list of filters on simple projected columns (AFTER project)
-                - groupBy: list of property paths to group by (if aggregation needed)
-                - aggregations: list of {function, property, alias} objects
-                - windowFunctions: list of {function, partitionBy, orderBy, alias} objects
-                - sort: list of {column, direction} objects
-                - limit: optional row limit
-                - distinct: boolean (if deduplication needed)
-                
-                Navigation uses dot notation through associations (e.g., "desk.name", "trader.badge").
-                
-                Available filter operators: ==, !=, >, <, >=, <=, contains, in, startsWith, endsWith
-                Available aggregation functions: sum, avg, count, min, max, stdDev, variance, median, mode, percentile
-                Available window functions: rowNumber, rank, denseRank, lead, lag, sum, avg, count, min, max
-                
-                Classify each filter as either:
-                - classFilter: requires navigating an association (e.g., "counterparty.name == 'Goldman'")
-                - relationFilter: operates on a simple property of the root class (e.g., "status == 'NEW'")
-                
-                Return ONLY valid JSON (no markdown, no explanation).
-                """;
-
-        String userMessage = "Root Class: " + rootClass + "\n\nData Model:\n" + schema +
-                "\n\nQuestion: " + question;
-
-        return llmClient.complete(systemPrompt, userMessage);
-    }
-
-    // ==================== Step 3: Pure Generator ====================
-
-    private String generatePure(String question, String rootClass, String queryPlan, String schema) {
-        String systemPrompt = PURE_GENERATOR_PROMPT;
-
-        String userMessage = "Root Class: " + rootClass +
-                "\n\nQuery Plan:\n" + queryPlan +
-                "\n\nData Model:\n" + schema +
-                "\n\nQuestion: " + question;
-
-        String response = llmClient.complete(systemPrompt, userMessage);
-
-        // Clean up: remove markdown code fences if present
-        response = response.strip();
-        if (response.startsWith("```")) {
-            response = response.replaceAll("^```[a-z]*\\n?", "").replaceAll("\\n?```$", "").strip();
-        }
-
-        return response;
-    }
-
-    // ==================== Helpers ====================
+    // ── JSON field extraction ─────────────────────────────────────────────────
 
     private static String extractJsonField(String json, String field) {
-        // Handle both with and without markdown code fences
-        String cleaned = json.strip();
-        if (cleaned.startsWith("```")) {
-            cleaned = cleaned.replaceAll("^```[a-z]*\\n?", "").replaceAll("\\n?```$", "").strip();
-        }
-
+        String cleaned = stripFences(json);
         Pattern p = Pattern.compile("\"" + field + "\"\\s*:\\s*\"([^\"]*?)\"");
         Matcher m = p.matcher(cleaned);
         if (m.find()) {
             return m.group(1);
         }
         throw new LlmClient.LlmException(
-                "Could not extract '" + field + "' from LLM response: " + json, -1, json);
+                "Could not extract '" + field + "' from response: " + json, -1, json);
+    }
+
+    /**
+     * Extracts the pureQuery field, which may contain special characters.
+     * Pure uses single quotes for strings so double quotes are safe JSON delimiters.
+     * Handles both compact and pretty-printed JSON.
+     */
+    private static String extractPureQuery(String json) {
+        String cleaned = stripFences(json);
+
+        // Match "pureQuery": "value" — value may span to end of JSON field
+        // Pure queries use single quotes; no unescaped double quotes inside
+        Pattern p = Pattern.compile("\"pureQuery\"\\s*:\\s*\"(.*?)\"\\s*[,}]", Pattern.DOTALL);
+        Matcher m = p.matcher(cleaned);
+        if (m.find()) {
+            return m.group(1).trim();
+        }
+
+        // Fallback: try without trailing delimiter (end of string)
+        Pattern p2 = Pattern.compile("\"pureQuery\"\\s*:\\s*\"(.*?)\"\\s*$", Pattern.DOTALL);
+        Matcher m2 = p2.matcher(cleaned);
+        if (m2.find()) {
+            return m2.group(1).trim();
+        }
+
+        throw new LlmClient.LlmException(
+                "Could not extract 'pureQuery' from response: " + json, -1, json);
+    }
+
+    private static String stripFences(String text) {
+        String s = text.strip();
+        if (s.startsWith("```")) {
+            s = s.replaceAll("^```[a-z]*\\n?", "").replaceAll("\\n?```$", "").strip();
+        }
+        return s;
     }
 
     private static String simpleName(String qualifiedName) {

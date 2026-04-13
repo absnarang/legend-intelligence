@@ -6,9 +6,13 @@ import org.finos.legend.engine.server.LegendHttpServer;
 import org.finos.legend.engine.server.LegendHttpJson;
 import org.finos.legend.pure.dsl.definition.PureModelBuilder;
 
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileReader;
 import java.io.IOException;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Properties;
 
 /**
  * Extends the base Legend HTTP server with the NLQ endpoint.
@@ -20,6 +24,7 @@ import java.util.Map;
 public class NlqHttpServer {
 
     public static void main(String[] args) throws IOException {
+        loadDotEnv();
         int port = 8080;
         String envPort = System.getenv("PORT");
         if (envPort != null && !envPort.isBlank()) {
@@ -60,13 +65,70 @@ public class NlqHttpServer {
     }
 
     /**
+     * Loads variables from .env file in the working directory (project root).
+     * Values are stored as JVM system properties (prefix: "dotenv.") so that
+     * LlmClient implementations can fall back to them when env vars are absent.
+     *
+     * Prefer using start-nlq.sh which sources .env into the shell environment
+     * before launching the JVM — that approach works for all env var consumers.
+     */
+    private static void loadDotEnv() {
+        File envFile = new File(".env");
+        if (!envFile.exists()) {
+            envFile = new File("../.env");
+        }
+        if (!envFile.exists()) return;
+
+        Properties loaded = new Properties();
+        try (BufferedReader reader = new BufferedReader(new FileReader(envFile))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                line = line.trim();
+                if (line.isEmpty() || line.startsWith("#")) continue;
+                int eq = line.indexOf('=');
+                if (eq <= 0) continue;
+                String key = line.substring(0, eq).trim();
+                String value = line.substring(eq + 1).trim();
+                // Strip optional surrounding quotes
+                if (value.length() >= 2 &&
+                        ((value.startsWith("\"") && value.endsWith("\"")) ||
+                         (value.startsWith("'") && value.endsWith("'")))) {
+                    value = value.substring(1, value.length() - 1);
+                }
+                if (!value.isBlank()) {
+                    loaded.setProperty(key, value);
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("[NlqHttpServer] Warning: could not read .env: " + e.getMessage());
+            return;
+        }
+
+        // Store as system properties so clients can read them
+        // Env vars (set by start-nlq.sh) take precedence over .env values
+        int count = 0;
+        for (String key : loaded.stringPropertyNames()) {
+            if (System.getenv(key) == null && System.getProperty(key) == null) {
+                System.setProperty(key, loaded.getProperty(key));
+                count++;
+            }
+        }
+        if (count > 0) {
+            System.out.printf("[NlqHttpServer] Loaded %d variable(s) from %s as system properties%n",
+                    count, envFile.getPath());
+            System.out.println("[NlqHttpServer] Tip: use start-nlq.sh to export .env into the shell for full compatibility.");
+        }
+    }
+
+    /**
      * NLQ - Natural Language Query to Pure.
      *
      * Request format:
      * {
      * "code": "full Pure model source",
      * "question": "show me total PnL by trader",
-     * "domain": "PnL" // optional hint
+     * "domain": "PnL",           // optional hint
+     * "model": "claude-haiku-4-5" // optional model override
      * }
      */
     static class NlqHandler implements HttpHandler {
@@ -99,6 +161,9 @@ public class NlqHttpServer {
                     return;
                 }
 
+                // Optional model override from request payload
+                String modelOverride = LegendHttpJson.getString(request, "model");
+
                 // Build model and index
                 PureModelBuilder modelBuilder = new PureModelBuilder();
                 modelBuilder.addSource(pureSource);
@@ -106,8 +171,8 @@ public class NlqHttpServer {
                 SemanticIndex index = new SemanticIndex();
                 index.buildIndex(modelBuilder);
 
-                // Create LLM client
-                LlmClient llmClient = LlmClientFactory.create();
+                // Create LLM client (with optional per-request model override)
+                LlmClient llmClient = LlmClientFactory.create(modelOverride);
 
                 // Run NLQ pipeline
                 NlqService nlqService = new NlqService(index, modelBuilder, llmClient);

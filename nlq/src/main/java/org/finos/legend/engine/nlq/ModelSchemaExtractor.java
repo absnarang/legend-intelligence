@@ -289,6 +289,239 @@ public class ModelSchemaExtractor {
     }
 
     /**
+     * Builds a rich-but-compact schema for LLM prompts, extracting all NLQ annotations
+     * (description, synonyms, sampleValues, unit, stereotype) in a structured format.
+     *
+     * This gives the LLM the semantic context it needs to generate accurate queries
+     * on the first try, while keeping the prompt size manageable (~1-2K chars).
+     *
+     * Example output (per class):
+     *   etf::Fund <<core>>
+     *     description: An investment fund (ETF or mutual fund)
+     *     synonyms: fund, etf, mutual fund, ticker
+     *     properties:
+     *       ticker: String
+     *       aum: Float  [unit: USD millions]  [e.g. 503000]
+     *       assetClass: String  [e.g. EQUITY, FIXED_INCOME, COMMODITY]
+     *     → holdings: Holding[*], navRecords: NAVRecord[*]
+     */
+    public static String extractRichCompactSchema(Set<String> classNames, PureModelBuilder modelBuilder) {
+        Map<String, PureClass> allClasses = modelBuilder.getAllClasses();
+        Map<String, Association> allAssociations = modelBuilder.getAllAssociations();
+
+        // Resolve to PureClass objects (primary + neighbors)
+        Map<String, PureClass> primaryClasses = new LinkedHashMap<>();
+        for (String name : classNames) {
+            PureClass pc = allClasses.get(name);
+            if (pc == null) for (PureClass c : allClasses.values()) if (c.name().equals(name)) { pc = c; break; }
+            if (pc != null) primaryClasses.put(pc.qualifiedName(), pc);
+        }
+
+        Set<String> primaryQNames = new LinkedHashSet<>();
+        for (PureClass pc : primaryClasses.values()) {
+            primaryQNames.add(pc.qualifiedName());
+            primaryQNames.add(pc.name());
+        }
+
+        // Build navigation map: qualifiedName → [(propName, targetClass, mult)]
+        Map<String, List<String>> navMap = new LinkedHashMap<>();
+        for (Association assoc : allAssociations.values()) {
+            String t1 = assoc.property1().targetClass();
+            String t2 = assoc.property2().targetClass();
+            for (PureClass pc : primaryClasses.values()) {
+                String qn = pc.qualifiedName();
+                if (matchesAny(t1, primaryQNames)) {
+                    navMap.computeIfAbsent(t1, k -> new ArrayList<>())
+                          .add(assoc.property2().propertyName() + ": " + simpleName(t2) + "[" + assoc.property2().multiplicity() + "]");
+                }
+                if (matchesAny(t2, primaryQNames)) {
+                    navMap.computeIfAbsent(t2, k -> new ArrayList<>())
+                          .add(assoc.property1().propertyName() + ": " + simpleName(t1) + "[" + assoc.property1().multiplicity() + "]");
+                }
+            }
+        }
+
+        StringBuilder sb = new StringBuilder();
+        for (PureClass pc : primaryClasses.values()) {
+            appendRichCompact(sb, pc, navMap);
+        }
+        return sb.toString();
+    }
+
+    private static void appendRichCompact(StringBuilder sb, PureClass pc, Map<String, List<String>> navMap) {
+        // Class name + stereotype
+        sb.append(pc.qualifiedName());
+        if (!pc.stereotypes().isEmpty()) {
+            sb.append(" <<");
+            for (int i = 0; i < pc.stereotypes().size(); i++) {
+                if (i > 0) sb.append(", ");
+                // Extract just the stereotype name (after the last dot)
+                String ref = pc.stereotypes().get(i).toReference();
+                int dot = ref.lastIndexOf('.');
+                sb.append(dot >= 0 ? ref.substring(dot + 1) : ref);
+            }
+            sb.append(">>");
+        }
+        sb.append("\n");
+
+        // Description (1 line, truncated at 120 chars)
+        String desc = pc.getTagValue("nlq::NlqProfile", "description");
+        if (desc == null) desc = pc.getTagValue("doc", "doc");
+        if (desc != null && !desc.isBlank()) {
+            sb.append("  desc: ").append(desc.length() > 120 ? desc.substring(0, 120) + "…" : desc).append("\n");
+        }
+
+        // Synonyms (compact)
+        String syn = pc.getTagValue("nlq::NlqProfile", "synonyms");
+        if (syn != null && !syn.isBlank()) {
+            sb.append("  synonyms: ").append(syn).append("\n");
+        }
+
+        // Properties with type + unit + sampleValues
+        sb.append("  properties:\n");
+        for (Property prop : pc.allProperties()) {
+            sb.append("    ").append(prop.name()).append(": ").append(prop.genericType().typeName());
+
+            String unit = prop.getTagValue("nlq::NlqProfile", "unit");
+            if (unit != null && !unit.isBlank()) {
+                sb.append("  [unit: ").append(unit).append("]");
+            }
+            String sample = prop.getTagValue("nlq::NlqProfile", "sampleValues");
+            if (sample != null && !sample.isBlank()) {
+                // Truncate samples to keep concise
+                String s = sample.length() > 80 ? sample.substring(0, 80) + "…" : sample;
+                sb.append("  [e.g. ").append(s).append("]");
+            }
+            sb.append("\n");
+        }
+
+        // Class-level unit/sample metadata (for context)
+        String classUnit = pc.getTagValue("nlq::NlqProfile", "unit");
+        if (classUnit != null && !classUnit.isBlank()) {
+            sb.append("  units: ").append(classUnit).append("\n");
+        }
+        String classSample = pc.getTagValue("nlq::NlqProfile", "sampleValues");
+        if (classSample != null && !classSample.isBlank()) {
+            sb.append("  sampleValues: ").append(
+                    classSample.length() > 120 ? classSample.substring(0, 120) + "…" : classSample).append("\n");
+        }
+
+        // Navigation (association paths)
+        List<String> navs = new ArrayList<>();
+        // Check by qualifiedName and by simple name
+        List<String> n1 = navMap.get(pc.qualifiedName());
+        List<String> n2 = navMap.get(pc.name());
+        if (n1 != null) navs.addAll(n1);
+        if (n2 != null) navs.addAll(n2);
+        if (!navs.isEmpty()) {
+            List<String> unique = navs.stream().distinct().toList();
+            sb.append("  nav: ").append(String.join(", ", unique)).append("\n");
+        }
+        sb.append("\n");
+    }
+
+    /**
+     * Builds an ultra-compact schema for LLM prompts — just class names, property
+     * names/types, and associations. No metadata, no descriptions, no annotations.
+     * Target output: ~300-600 chars regardless of how richly annotated the model is.
+     *
+     * Example output:
+     *   etf::Fund: fundId(Integer), ticker(String), aum(Float), assetClass(String)
+     *     → holdings: [Holding], navRecords: [NAVRecord]
+     *   etf::Holding: holdingId(Integer), weight(Float), shares(Float)
+     *     ← fund: Fund, ← security: Security
+     */
+    public static String extractMinimalSchema(Set<String> classNames, PureModelBuilder modelBuilder) {
+        Map<String, PureClass> allClasses = modelBuilder.getAllClasses();
+        Map<String, Association> allAssociations = modelBuilder.getAllAssociations();
+
+        // Resolve to PureClass objects
+        Map<String, PureClass> primaryClasses = new LinkedHashMap<>();
+        for (String name : classNames) {
+            PureClass pc = allClasses.get(name);
+            if (pc == null) {
+                for (PureClass candidate : allClasses.values()) {
+                    if (candidate.name().equals(name)) { pc = candidate; break; }
+                }
+            }
+            if (pc != null) primaryClasses.put(pc.qualifiedName(), pc);
+        }
+
+        // Build navigation map: class → [(propName, targetClass, mult)]
+        Map<String, List<String[]>> navMap = new LinkedHashMap<>();
+        for (PureClass pc : primaryClasses.values()) {
+            navMap.put(pc.qualifiedName(), new ArrayList<>());
+        }
+        for (Association assoc : allAssociations.values()) {
+            String t1 = assoc.property1().targetClass();
+            String t2 = assoc.property2().targetClass();
+            for (PureClass pc : primaryClasses.values()) {
+                String qn = pc.qualifiedName();
+                String sn = pc.name();
+                // t1 can navigate to t2 via property2
+                if (t1.equals(qn) || t1.equals(sn)) {
+                    navMap.computeIfAbsent(qn, k -> new ArrayList<>())
+                          .add(new String[]{assoc.property2().propertyName(), simpleName(t2), assoc.property2().multiplicity().toString()});
+                }
+                if (t2.equals(qn) || t2.equals(sn)) {
+                    navMap.computeIfAbsent(qn, k -> new ArrayList<>())
+                          .add(new String[]{assoc.property1().propertyName(), simpleName(t1), assoc.property1().multiplicity().toString()});
+                }
+            }
+        }
+
+        // Also include 1-hop neighbors so LLM knows about navigable types
+        Set<String> neighborNames = new LinkedHashSet<>();
+        for (Association assoc : allAssociations.values()) {
+            String t1 = assoc.property1().targetClass();
+            String t2 = assoc.property2().targetClass();
+            boolean t1Primary = primaryClasses.values().stream().anyMatch(pc -> pc.qualifiedName().equals(t1) || pc.name().equals(t1));
+            boolean t2Primary = primaryClasses.values().stream().anyMatch(pc -> pc.qualifiedName().equals(t2) || pc.name().equals(t2));
+            if (t1Primary && !t2Primary) neighborNames.add(t2);
+            if (t2Primary && !t1Primary) neighborNames.add(t1);
+        }
+        Map<String, PureClass> neighborClasses = new LinkedHashMap<>();
+        for (String name : neighborNames) {
+            PureClass pc = allClasses.get(name);
+            if (pc == null) for (PureClass c : allClasses.values()) if (c.name().equals(name)) { pc = c; break; }
+            if (pc != null && !primaryClasses.containsKey(pc.qualifiedName())) neighborClasses.put(pc.qualifiedName(), pc);
+        }
+
+        StringBuilder sb = new StringBuilder();
+        for (PureClass pc : primaryClasses.values()) {
+            appendMinimal(sb, pc, navMap.getOrDefault(pc.qualifiedName(), List.of()));
+        }
+        if (!neighborClasses.isEmpty()) {
+            sb.append("  (related: ");
+            sb.append(String.join(", ", neighborClasses.values().stream().map(PureClass::qualifiedName).toList()));
+            sb.append(")\n");
+        }
+        return sb.toString();
+    }
+
+    private static void appendMinimal(StringBuilder sb, PureClass pc, List<String[]> nav) {
+        sb.append(pc.qualifiedName()).append(": ");
+
+        // Properties — name(Type) format, max 12
+        List<String> propParts = new ArrayList<>();
+        int count = 0;
+        for (Property prop : pc.allProperties()) {
+            if (count++ >= 12) { propParts.add("..."); break; }
+            propParts.add(prop.name() + "(" + prop.genericType().typeName() + ")");
+        }
+        sb.append(String.join(", ", propParts)).append("\n");
+
+        // Navigation
+        if (!nav.isEmpty()) {
+            List<String> navParts = new ArrayList<>();
+            for (String[] n : nav) {
+                navParts.add(n[0] + ": " + n[1] + "[" + n[2] + "]");
+            }
+            sb.append("  nav: ").append(String.join(", ", navParts)).append("\n");
+        }
+    }
+
+    /**
      * Extracts routing hints from model metadata for the semantic router.
      * Builds a compact string of disambiguation hints from whenToUse and exampleQuestions tags.
      * Returns empty string if no hints are found (model-agnostic).
