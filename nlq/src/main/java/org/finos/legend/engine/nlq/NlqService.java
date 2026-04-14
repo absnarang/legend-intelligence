@@ -33,16 +33,24 @@ public class NlqService {
             - Fully-qualify: etf::Fund not Fund
             - project() FIRST, then filter/sort/limit/groupBy
             - project: [f|$f.prop, f|$f.assoc.prop], ['alias', 'alias2'] — camelCase aliases, single quotes
-            - filter after project: ->filter({row|$row.col == 'X'})  — use $row.prop, no getString()
-            - filter before project: ONLY for association: ->filter({h|$h.fund.ticker == 'SPY'})->project(...)
+            - filter after project: ->filter({row|$row.col == 'X'})  — use $row.alias, only for columns included in project()
+            - filter before project: ->filter(f|$f.prop == 'X')->project(...) — use for class properties, especially when the filter column is NOT projected. Works for both direct props and associations (e.g., f|$f.fundType == 'ETF' or h|$h.fund.ticker == 'SPY')
             - sort: ->sort('col') or ->sort(descending('col'))
-            - limit: ->limit(5)
+            - limit: ->take(5)
             - groupBy: ->groupBy([{r|$r.col}],[{r|$r.val->sum()}],['col','total'])  agg: sum/avg/count/min/max
 
+            ROOT CLASS SELECTION:
+            - For "how many X per Y" or "count X by Y": root = the entity being counted (X)
+            - For questions about line items / details with parent info: root = detail class (e.g., OrderDetail), navigate to parent via association
+            - For "average/sum X per Y": root = the class that OWNS property X, navigate to Y via association
+            - When the question mentions both a parent and its details, prefer starting from the detail class to get one row per detail
+            - If a class has a whenToUse annotation, follow it
+
             EXAMPLES:
-            {"rootClass":"etf::Fund","pureQuery":"etf::Fund.all()->project([f|$f.ticker,f|$f.aum],['ticker','aum'])->filter({row|$row.aum>100000})->sort(descending('aum'))->limit(5)"}
+            {"rootClass":"etf::Fund","pureQuery":"etf::Fund.all()->project([f|$f.ticker,f|$f.aum],['ticker','aum'])->filter({row|$row.aum>100000})->sort(descending('aum'))->take(5)"}
             {"rootClass":"etf::Holding","pureQuery":"etf::Holding.all()->filter({h|$h.fund.ticker=='SPY'})->project([h|$h.security.ticker,h|$h.weight],['sec','weight'])->sort(descending('weight'))"}
             {"rootClass":"etf::Holding","pureQuery":"etf::Holding.all()->filter({h|$h.security.ticker=='AAPL'})->project([h|$h.fund.ticker,h|$h.marketValue],['fund','mv'])->groupBy([{r|$r.fund}],[{r|$r.mv->sum()}],['fund','total'])"}
+            {"rootClass":"northwind::model::OrderDetail","pureQuery":"northwind::model::OrderDetail.all()->project([d|$d.order.orderId,d|$d.order.orderDate,d|$d.product.productName,d|$d.quantity,d|$d.unitPrice],['orderId','orderDate','product','quantity','unitPrice'])->sort('orderId')"}
             """;
 
     private final SemanticIndex index;
@@ -67,8 +75,12 @@ public class NlqService {
             Set<String> classNames = retrieved.stream()
                     .map(SemanticIndex.RetrievalResult::qualifiedName)
                     .collect(Collectors.toSet());
-            List<String> retrievedList = retrieved.stream()
-                    .map(r -> simpleName(r.qualifiedName()))
+
+            // Expand with 1-hop associations to ensure related classes are included
+            classNames = index.expandWithAssociations(classNames, modelBuilder, 1);
+
+            List<String> retrievedList = classNames.stream()
+                    .map(NlqService::simpleName)
                     .toList();
 
             // Extract focused schema for context (rich compact format leverages NlqProfile metadata)
