@@ -31,13 +31,19 @@ public class NlqService {
 
             RULES:
             - Fully-qualify: etf::Fund not Fund
-            - project() FIRST, then filter/sort/limit/groupBy
-            - project: [f|$f.prop, f|$f.assoc.prop], ['alias', 'alias2'] — camelCase aliases, single quotes
+            - project() FIRST, then filter/sort/groupBy/take
+            - project: [f|$f.prop, f|$f.assoc.prop], ['alias', 'alias2'] — single quotes
             - filter after project: ->filter({row|$row.col == 'X'})  — use $row.alias, only for columns included in project()
             - filter before project: ->filter(f|$f.prop == 'X')->project(...) — use for class properties, especially when the filter column is NOT projected. Works for both direct props and associations (e.g., f|$f.fundType == 'ETF' or h|$h.fund.ticker == 'SPY')
-            - sort: ->sort('col') or ->sort(descending('col'))
+            - sort ascending: ->sort('col')
+            - sort descending: ->sort(~col->descending())
             - limit: ->take(5)
             - groupBy: ->groupBy([{r|$r.col}],[{r|$r.val->sum()}],['col','total'])  agg: sum/avg/count/min/max
+
+            COLUMN ALIAS CONVENTIONS:
+            - Use SHORT names for association-navigated columns: 'product' not 'productName', 'country' not 'shipCountry', 'customer' not 'companyName', 'category' not 'categoryName'
+            - Keep direct numeric/metric property names as-is: 'unitPrice', 'aum', 'weight', 'freight'
+            - GroupBy aggregation aliases: count→'{dim}Count' (e.g. 'orderCount'), sum→'total{Prop}' (e.g. 'totalFreight'), avg→'avg{Prop}' (e.g. 'avgPrice')
 
             ROOT CLASS SELECTION:
             - For "how many X per Y" or "count X by Y": root = the entity being counted (X)
@@ -47,10 +53,12 @@ public class NlqService {
             - If a class has a whenToUse annotation, follow it
 
             EXAMPLES:
-            {"rootClass":"etf::Fund","pureQuery":"etf::Fund.all()->project([f|$f.ticker,f|$f.aum],['ticker','aum'])->filter({row|$row.aum>100000})->sort(descending('aum'))->take(5)"}
-            {"rootClass":"etf::Holding","pureQuery":"etf::Holding.all()->filter({h|$h.fund.ticker=='SPY'})->project([h|$h.security.ticker,h|$h.weight],['sec','weight'])->sort(descending('weight'))"}
+            {"rootClass":"etf::Fund","pureQuery":"etf::Fund.all()->project([f|$f.ticker,f|$f.aum],['ticker','aum'])->filter({row|$row.aum>100000})->sort(~aum->descending())->take(5)"}
+            {"rootClass":"etf::Holding","pureQuery":"etf::Holding.all()->filter({h|$h.fund.ticker=='SPY'})->project([h|$h.security.ticker,h|$h.weight],['sec','weight'])->sort(~weight->descending())"}
             {"rootClass":"etf::Holding","pureQuery":"etf::Holding.all()->filter({h|$h.security.ticker=='AAPL'})->project([h|$h.fund.ticker,h|$h.marketValue],['fund','mv'])->groupBy([{r|$r.fund}],[{r|$r.mv->sum()}],['fund','total'])"}
             {"rootClass":"northwind::model::OrderDetail","pureQuery":"northwind::model::OrderDetail.all()->project([d|$d.order.orderId,d|$d.order.orderDate,d|$d.product.productName,d|$d.quantity,d|$d.unitPrice],['orderId','orderDate','product','quantity','unitPrice'])->sort('orderId')"}
+            {"rootClass":"northwind::model::Order","pureQuery":"northwind::model::Order.all()->project([o|$o.shipCountry,o|$o.orderId],['country','orderId'])->groupBy([{r|$r.country}],[{r|$r.orderId->count()}],['country','orderCount'])->sort(~orderCount->descending())"}
+            {"rootClass":"northwind::model::Product","pureQuery":"northwind::model::Product.all()->project([p|$p.category.categoryName,p|$p.unitPrice],['category','unitPrice'])->groupBy([{r|$r.category}],[{r|$r.unitPrice->avg()}],['category','avgPrice'])->sort('category')"}
             """;
 
     private final SemanticIndex index;
