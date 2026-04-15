@@ -543,7 +543,7 @@ public final class PureCompiler {
 
         // Track joins we need to add for association projections
         // Key: association property name, Value: join info (alias and mapping)
-        java.util.Map<String, JoinInfo> joinInfos = new java.util.HashMap<>();
+        java.util.Map<String, JoinInfo> joinInfos = new java.util.LinkedHashMap<>();
 
         for (int i = 0; i < project.projections().size(); i++) {
             LambdaExpression lambda = project.projections().get(i);
@@ -741,7 +741,7 @@ public final class PureCompiler {
             // Create the join ON TOP of the current finalSource
             TableNode targetTable = new TableNode(ji.targetMapping().table(), ji.alias());
             Expression joinCondition = ComparisonExpression.equals(
-                    ColumnReference.of(baseTableAlias, ji.leftColumn(), baseMapping.table().getColumnType(ji.leftColumn())),
+                    ColumnReference.of(ji.sourceAlias(), ji.leftColumn(), ji.sourceAlias().equals(baseTableAlias) ? baseMapping.table().getColumnType(ji.leftColumn()) : findMappingForAlias(ji.sourceAlias(), joinInfos).getColumnType(ji.leftColumn())),
                     ColumnReference.of(ji.alias(), ji.rightColumn(), ji.targetMapping().table().getColumnType(ji.rightColumn())));
             finalSource = new JoinNode(finalSource, targetTable, joinCondition, JoinNode.JoinType.LEFT_OUTER);
         }
@@ -3571,62 +3571,64 @@ public final class PureCompiler {
 
         List<NavigationSegment> segments = path.segments();
 
-        // Find the association navigation segment
-        NavigationSegment assocSegment = null;
+        // Iterate through ALL association navigation segments to support multi-hop paths
+        // e.g., $d.product.category.categoryName has two hops: product and category
+        RelationalMapping currentMapping = baseMapping;
+        String currentAlias = baseTableAlias;
+
         for (NavigationSegment seg : segments) {
-            if (seg.isAssociationNavigation()) {
-                assocSegment = seg;
-                break;
+            if (!seg.isAssociationNavigation()) {
+                continue; // skip — this is the final property segment
             }
+
+            String assocPropertyName = seg.propertyName();
+            AssociationNavigation nav = seg.navigation();
+            RelationalMapping targetMapping = seg.targetMapping();
+
+            if (targetMapping == null || nav.join() == null) {
+                throw new PureCompileException("No mapping or join for association: " + nav.association().name());
+            }
+
+            // Use sourceAlias + propertyName as key to handle same association at different levels
+            String joinKey = currentAlias + "." + assocPropertyName;
+            JoinInfo joinInfo = joinInfos.get(joinKey);
+
+            if (joinInfo == null) {
+                // Need to record join info (actual join built later)
+                String targetAlias = "j" + aliasCounter++;
+
+                Join join = nav.join();
+                String leftColumn = join.getColumnForTable(currentMapping.table().name());
+                String rightColumn = join.getColumnForTable(targetMapping.table().name());
+
+                joinInfo = new JoinInfo(targetAlias, targetMapping, leftColumn, rightColumn, currentAlias);
+                joinInfos.put(joinKey, joinInfo);
+            }
+
+            currentMapping = joinInfo.targetMapping();
+            currentAlias = joinInfo.alias();
         }
 
-        if (assocSegment == null) {
-            throw new PureCompileException("No association found in path");
-        }
-
-        String assocPropertyName = assocSegment.propertyName();
-        AssociationNavigation nav = assocSegment.navigation();
-        RelationalMapping targetMapping = assocSegment.targetMapping();
-
-        if (targetMapping == null || nav.join() == null) {
-            throw new PureCompileException("No mapping or join for association: " + nav.association().name());
-        }
-
-        // Check if we already have join info for this association
-        JoinInfo joinInfo = joinInfos.get(assocPropertyName);
-        String targetAlias;
-
-        if (joinInfo == null) {
-            // Need to record join info (actual join built later)
-            targetAlias = "j" + aliasCounter++;
-
-            Join join = nav.join();
-            String leftColumn = join.getColumnForTable(baseMapping.table().name());
-            String rightColumn = join.getColumnForTable(targetMapping.table().name());
-
-            joinInfo = new JoinInfo(targetAlias, targetMapping, leftColumn, rightColumn);
-            joinInfos.put(assocPropertyName, joinInfo);
-        } else {
-            targetAlias = joinInfo.alias();
-            targetMapping = joinInfo.targetMapping();
-        }
-
-        // Get the final property (e.g., "street" from $p.addresses.street)
+        // Get the final property (e.g., "categoryName" from $d.product.category.categoryName)
         NavigationSegment finalSegment = segments.getLast();
         String finalProperty = finalSegment.propertyName();
 
+        // currentMapping is now the LAST hop's target — look up the final property there
+        RelationalMapping finalMapping = currentMapping;
+        String finalAlias = currentAlias;
+
         // Check if the property has an expression mapping (e.g., ->get('key', @Type))
-        PropertyMapping propertyMapping = targetMapping.getPropertyMapping(finalProperty)
+        PropertyMapping propertyMapping = finalMapping.getPropertyMapping(finalProperty)
                 .orElseThrow(() -> new PureCompileException("No property mapping for: " + finalProperty));
 
         if (propertyMapping.expressionString() != null) {
             // Expression mapping (JSON extraction) - use compileExpressionMapping
-            Expression expr = compileExpressionMapping(propertyMapping.expressionString(), targetAlias);
+            Expression expr = compileExpressionMapping(propertyMapping.expressionString(), finalAlias);
             return new Projection(expr, projectionAlias);
         } else {
             // Simple column mapping
             String columnName = propertyMapping.columnName();
-            return Projection.column(targetAlias, columnName, projectionAlias, targetMapping.pureTypeForProperty(finalProperty));
+            return Projection.column(finalAlias, columnName, projectionAlias, finalMapping.pureTypeForProperty(finalProperty));
         }
     }
 
@@ -3705,7 +3707,20 @@ public final class PureCompiler {
             String alias,
             RelationalMapping targetMapping,
             String leftColumn,
-            String rightColumn) {
+            String rightColumn,
+            String sourceAlias) {
+    }
+
+    /**
+     * Finds the RelationalMapping table for a given join alias by searching through joinInfos.
+     */
+    private static Table findMappingForAlias(String alias, java.util.Map<String, JoinInfo> joinInfos) {
+        for (JoinInfo ji : joinInfos.values()) {
+            if (ji.alias().equals(alias)) {
+                return ji.targetMapping().table();
+            }
+        }
+        throw new PureCompileException("No join found for alias: " + alias);
     }
 
     /**
