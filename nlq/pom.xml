@@ -32,6 +32,14 @@
             <artifactId>sqlite-jdbc</artifactId>
         </dependency>
 
+        <!-- ANTLR4 Runtime — needed at test time for PureDefinitionParser (transitive from engine,
+             but the engine's shade plugin absorbs it so it doesn't propagate) -->
+        <dependency>
+            <groupId>org.antlr</groupId>
+            <artifactId>antlr4-runtime</artifactId>
+            <scope>test</scope>
+        </dependency>
+
         <!-- JUnit 5 -->
         <dependency>
             <groupId>org.junit.jupiter</groupId>
