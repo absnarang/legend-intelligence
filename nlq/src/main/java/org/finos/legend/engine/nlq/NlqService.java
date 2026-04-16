@@ -52,11 +52,21 @@ public class NlqService {
             - When the question mentions both a parent and its details, prefer starting from the detail class to get one row per detail
             - If a class has a whenToUse annotation, follow it
 
+            COMMON MISTAKES — never do these:
+            - WRONG: descending('col')  CORRECT: ~col->descending()
+            - WRONG: arithmetic in project like $h.marketValue / $h.shares  CORRECT: project raw columns separately
+            - WRONG: filter after project using property names  CORRECT: post-project filter must use the projected alias names exactly
+
             EXAMPLES:
             {"rootClass":"etf::Fund","pureQuery":"etf::Fund.all()->project([f|$f.ticker,f|$f.aum],['ticker','aum'])->filter({row|$row.aum>100000})->sort(~aum->descending())->take(5)"}
             {"rootClass":"etf::Holding","pureQuery":"etf::Holding.all()->filter({h|$h.fund.ticker=='SPY'})->project([h|$h.security.ticker,h|$h.weight],['sec','weight'])->sort(~weight->descending())"}
             {"rootClass":"etf::Holding","pureQuery":"etf::Holding.all()->filter({h|$h.security.ticker=='AAPL'})->project([h|$h.fund.ticker,h|$h.marketValue],['fund','mv'])->groupBy([{r|$r.fund}],[{r|$r.mv->sum()}],['fund','total'])"}
+            {"rootClass":"etf::Holding","pureQuery":"etf::Holding.all()->project([h|$h.weight,h|$h.marketValue,h|$h.security.companyName,h|$h.security.sector],['weight','marketValue','company','sector'])"}
+            {"rootClass":"etf::Holding","pureQuery":"etf::Holding.all()->filter(h|$h.weight > 5)->project([h|$h.holdingId,h|$h.weight,h|$h.marketValue],['holdingId','weight','marketValue'])->sort(~weight->descending())"}
+            {"rootClass":"etf::Fund","pureQuery":"etf::Fund.all()->project([f|$f.ticker,f|$f.fundName,f|$f.expenseRatio],['ticker','fundName','expenseRatio'])"}
+            {"rootClass":"etf::Holding","pureQuery":"etf::Holding.all()->project([h|$h.security.ticker,h|$h.fund.ticker,h|$h.marketValue],['security','fund','marketValue'])->sort(~marketValue->descending())->take(10)"}
             {"rootClass":"northwind::model::OrderDetail","pureQuery":"northwind::model::OrderDetail.all()->project([d|$d.order.orderId,d|$d.order.orderDate,d|$d.product.productName,d|$d.quantity,d|$d.unitPrice],['orderId','orderDate','product','quantity','unitPrice'])->sort('orderId')"}
+            {"rootClass":"northwind::model::OrderDetail","pureQuery":"northwind::model::OrderDetail.all()->project([d|$d.quantity,d|$d.unitPrice,d|$d.product.productName,d|$d.product.category.categoryName],['quantity','unitPrice','product','category'])"}
             {"rootClass":"northwind::model::Order","pureQuery":"northwind::model::Order.all()->project([o|$o.shipCountry,o|$o.orderId],['country','orderId'])->groupBy([{r|$r.country}],[{r|$r.orderId->count()}],['country','orderCount'])->sort(~orderCount->descending())"}
             {"rootClass":"northwind::model::Product","pureQuery":"northwind::model::Product.all()->project([p|$p.category.categoryName,p|$p.unitPrice],['category','unitPrice'])->groupBy([{r|$r.category}],[{r|$r.unitPrice->avg()}],['category','avgPrice'])->sort('category')"}
             """;
@@ -84,15 +94,21 @@ public class NlqService {
                     .map(SemanticIndex.RetrievalResult::qualifiedName)
                     .collect(Collectors.toSet());
 
-            // Expand with 1-hop associations to ensure related classes are included
-            classNames = index.expandWithAssociations(classNames, modelBuilder, 1);
-
+            // Report original TF-IDF retrieval for precision scoring
             List<String> retrievedList = classNames.stream()
                     .map(NlqService::simpleName)
                     .toList();
 
+            // Expand with 1-hop associations for schema context (gives LLM
+            // visibility into neighbor classes for join navigation), but only
+            // when TF-IDF returned few classes
+            Set<String> schemaClasses = classNames;
+            if (classNames.size() <= 3) {
+                schemaClasses = index.expandWithAssociations(classNames, modelBuilder, 1);
+            }
+
             // Extract focused schema for context (rich compact format leverages NlqProfile metadata)
-            String schema = ModelSchemaExtractor.extractRichCompactSchema(classNames, modelBuilder);
+            String schema = ModelSchemaExtractor.extractRichCompactSchema(schemaClasses, modelBuilder);
 
             // Build user message
             String baseMessage = buildMessage(question, schema, null, null);
