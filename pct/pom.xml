@@ -154,6 +154,13 @@
             <scope>test</scope>
         </dependency>
 
+        <!-- DuckDB JDBC Driver (shaded into engine fat JAR, needed explicitly at test time) -->
+        <dependency>
+            <groupId>org.duckdb</groupId>
+            <artifactId>duckdb_jdbc</artifactId>
+            <scope>test</scope>
+        </dependency>
+
         <!-- JUnit 4 (required by PCT framework) -->
         <dependency>
             <groupId>junit</groupId>
