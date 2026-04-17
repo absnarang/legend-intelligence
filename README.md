@@ -2,7 +2,7 @@
 
 ### A Pure-language compiler and NLQ engine that turns English into instant SQL answers — so the PM gets data in seconds, not days.
 
-Legend Intelligence is a clean-room implementation of the [FINOS Legend](https://legend.finos.org/) Pure language engine paired with a Natural Language Query pipeline. Write strongly-typed Pure queries or ask in plain English — every query compiles 100% to SQL. No data ever leaves the database into the JVM. Backed by DuckDB in-memory for instant, zero-infra execution.
+Legend Intelligence is a ground-up implementation of the [FINOS Legend](https://legend.finos.org/) Pure language engine paired with a Natural Language Query pipeline. Write strongly-typed Pure queries or ask in plain English — every query compiles 100% to SQL, and no data ever leaves the database into the JVM. One fat JAR, backed by DuckDB in-memory, for instant zero-infra execution.
 
 > **1,100+ tests · 24 aggregate functions · 28 expression types · 25 ANTLR grammars · 3 LLM providers**
 
