@@ -37,15 +37,10 @@ class NlqPipelineTest {
 
     @Test
     @Order(1)
-    @DisplayName("Full pipeline: 3 LLM calls for routing, planning, generating")
+    @DisplayName("Full pipeline: single LLM call returning rootClass + pureQuery")
     void testFullPipeline() {
         MockLlmClient mock = MockLlmClient.withResponses(
-                // Step 1: Router response
-                "{\"rootClass\": \"Trade\", \"reasoning\": \"querying trades\"}",
-                // Step 2: Planner response
-                "{\"projections\": [\"tradeId\", \"notional\"], \"filters\": [{\"path\": \"status\", \"op\": \"==\", \"value\": \"NEW\"}]}",
-                // Step 3: Generator response
-                "Trade.all()->filter(t|$t.status == 'NEW')->project([t|$t.tradeId, t|$t.notional], ['Trade ID', 'Notional'])"
+                "{\"rootClass\": \"Trade\", \"pureQuery\": \"Trade.all()->filter(t|$t.status == 'NEW')->project([t|$t.tradeId, t|$t.notional], ['Trade ID', 'Notional'])\"}"
         );
 
         NlqService service = new NlqService(index, modelBuilder, mock);
@@ -58,7 +53,7 @@ class NlqPipelineTest {
         assertNotNull(result.retrievedClasses());
         assertFalse(result.retrievedClasses().isEmpty());
         assertTrue(result.latencyMs() >= 0);
-        assertEquals(3, mock.callCount(), "Should make exactly 3 LLM calls");
+        assertEquals(1, mock.callCount(), "Should make exactly 1 LLM call");
     }
 
     @Test
@@ -85,9 +80,7 @@ class NlqPipelineTest {
     @DisplayName("Pipeline with domain hint narrows retrieval")
     void testDomainHint() {
         MockLlmClient mock = MockLlmClient.withResponses(
-                "{\"rootClass\": \"DailyPnL\", \"reasoning\": \"PnL query\"}",
-                "{\"projections\": [\"totalPnL\"]}",
-                "DailyPnL.all()->project([p|$p.totalPnL], ['Total PnL'])"
+                "{\"rootClass\": \"DailyPnL\", \"pureQuery\": \"DailyPnL.all()->project([p|$p.totalPnL], ['Total PnL'])\"}"
         );
 
         NlqService service = new NlqService(index, modelBuilder, mock);
@@ -95,6 +88,7 @@ class NlqPipelineTest {
 
         assertTrue(result.isValid());
         assertEquals("DailyPnL", result.rootClass());
+        assertEquals(1, mock.callCount(), "Should make exactly 1 LLM call");
     }
 
     @Test
@@ -102,9 +96,7 @@ class NlqPipelineTest {
     @DisplayName("Pipeline strips markdown code fences from LLM output")
     void testCodeFenceStripping() {
         MockLlmClient mock = MockLlmClient.withResponses(
-                "```json\n{\"rootClass\": \"Trade\", \"reasoning\": \"trades\"}\n```",
-                "```json\n{\"projections\": [\"tradeId\"]}\n```",
-                "```pure\nTrade.all()->project([t|$t.tradeId], ['ID'])\n```"
+                "```json\n{\"rootClass\": \"Trade\", \"pureQuery\": \"Trade.all()->project([t|$t.tradeId], ['ID'])\"}\n```"
         );
 
         NlqService service = new NlqService(index, modelBuilder, mock);
@@ -114,6 +106,7 @@ class NlqPipelineTest {
         assertEquals("Trade", result.rootClass());
         assertFalse(result.pureQuery().contains("```"), "Code fences should be stripped");
         assertTrue(result.pureQuery().startsWith("Trade.all()"));
+        assertEquals(1, mock.callCount(), "Should make exactly 1 LLM call");
     }
 
     @Test
@@ -121,15 +114,14 @@ class NlqPipelineTest {
     @DisplayName("Retrieved classes list is populated")
     void testRetrievedClassesList() {
         MockLlmClient mock = MockLlmClient.withResponses(
-                "{\"rootClass\": \"VaRResult\", \"reasoning\": \"risk query\"}",
-                "{\"projections\": [\"var95\"]}",
-                "VaRResult.all()->project([v|$v.var95], ['VaR'])"
+                "{\"rootClass\": \"VaRResult\", \"pureQuery\": \"VaRResult.all()->project([v|$v.var95], ['VaR'])\"}"
         );
 
         NlqService service = new NlqService(index, modelBuilder, mock);
         NlqResult result = service.process("VaR by portfolio", null);
 
         assertTrue(result.isValid());
+        assertEquals(1, mock.callCount(), "Should make exactly 1 LLM call");
         assertTrue(result.retrievedClasses().contains("VaRResult"),
                 "Should include VaRResult: " + result.retrievedClasses());
         assertTrue(result.retrievedClasses().contains("Portfolio"),
