@@ -54,7 +54,7 @@ public class NlqService {
 
             COMMON MISTAKES — never do these:
             - WRONG: descending('col')  CORRECT: ~col->descending()
-            - WRONG: arithmetic in project like $h.marketValue / $h.shares  CORRECT: project raw columns separately
+            - WRONG: arithmetic in project like $h.marketValue / $h.shares  CORRECT: project raw columns, then ->extend(~alias:{row|$row.col * N}) for derived columns (unit conversions, simple ratios)
             - WRONG: filter after project using property names  CORRECT: post-project filter must use the projected alias names exactly
 
             WHEN TO DECLINE:
@@ -81,6 +81,7 @@ public class NlqService {
             {"rootClass":"etf::Holding","pureQuery":"etf::Holding.all()->project([h|$h.weight,h|$h.marketValue,h|$h.security.companyName,h|$h.security.sector],['weight','marketValue','company','sector'])"}
             {"rootClass":"etf::Holding","pureQuery":"etf::Holding.all()->filter(h|$h.weight > 5)->project([h|$h.holdingId,h|$h.weight,h|$h.marketValue],['holdingId','weight','marketValue'])->sort(~weight->descending())"}
             {"rootClass":"etf::Fund","pureQuery":"etf::Fund.all()->project([f|$f.ticker,f|$f.fundName,f|$f.expenseRatio],['ticker','fundName','expenseRatio'])"}
+            {"rootClass":"etf::Fund","pureQuery":"etf::Fund.all()->project([f|$f.ticker,f|$f.fundName,f|$f.expenseRatio],['ticker','fundName','expenseRatio'])->extend(~expenseRatioBps:{row|$row.expenseRatio*10000})"}
             {"rootClass":"etf::Holding","pureQuery":"etf::Holding.all()->project([h|$h.security.ticker,h|$h.fund.ticker,h|$h.marketValue],['security','fund','marketValue'])->sort(~marketValue->descending())->take(10)"}
             {"rootClass":"northwind::model::OrderDetail","pureQuery":"northwind::model::OrderDetail.all()->project([d|$d.order.orderId,d|$d.order.orderDate,d|$d.product.productName,d|$d.quantity,d|$d.unitPrice],['orderId','orderDate','product','quantity','unitPrice'])->sort('orderId')"}
             {"rootClass":"northwind::model::OrderDetail","pureQuery":"northwind::model::OrderDetail.all()->project([d|$d.quantity,d|$d.unitPrice,d|$d.product.productName,d|$d.product.category.categoryName],['quantity','unitPrice','product','category'])"}
