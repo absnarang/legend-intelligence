@@ -16,8 +16,9 @@ Legend Intelligence is a ground-up implementation of the [FINOS Legend](https://
 | Pure queries require a full Legend Engine deployment (150+ JARs, Postgres, metadata store) | Single fat JAR, in-memory DuckDB, `java -jar` and done |
 | Schema changes break downstream queries silently | Strongly-typed Pure model catches errors at compile time |
 | LLM-generated SQL hallucinates tables and columns | SemanticIndex retrieves real schema → LLM generates Pure → compiler validates before execution |
+| LLM hallucinates answers for unanswerable questions | Pipeline gracefully declines with a follow-up question when the question is outside the model's scope |
 | Analysts context-switch between Pure, SQL, and Python | One language (Pure) compiles to SQL; NLQ bridges from English |
-| Testing NLQ accuracy means eyeballing answers | Built-in eval framework scores retrieval recall, precision, ops coverage, and answer accuracy |
+| Testing NLQ accuracy means eyeballing answers | Built-in eval framework scores retrieval recall, query precision, ops coverage, answer accuracy, and follow-up quality |
 
 ---
 
@@ -103,14 +104,18 @@ sequenceDiagram
     SE-->>NLQ: Compact schema context
     NLQ->>LLM: System prompt + schema + question
     LLM-->>NLQ: {"rootClass": "etf::Fund", "pureQuery": "..."}
-    NLQ->>Engine: Validate Pure syntax
-    alt Parse failure
-        NLQ->>LLM: Retry with error context (max 2)
-        LLM-->>NLQ: Corrected query
+    alt Decline (cannotAnswer: true)
+        NLQ-->>PM: Follow-up question ("Could you specify which fund?")
+    else Normal response
+        NLQ->>Engine: Validate Pure syntax
+        alt Parse failure
+            NLQ->>LLM: Retry with error context (max 2)
+            LLM-->>NLQ: Corrected query
+        end
+        NLQ->>Engine: Compile + execute
+        Engine->>DB: SQL
+        DB-->>PM: Results table
     end
-    NLQ->>Engine: Compile + execute
-    Engine->>DB: SQL
-    DB-->>PM: Results table
 ```
 
 ---
@@ -223,7 +228,7 @@ curl -X POST http://localhost:8080/engine/nlq \
 | `POST` | `/engine/execute` | Compile + execute a Pure query against DuckDB → JSON rows |
 | `POST` | `/engine/plan` | Compile Pure → SQL only (no execution) |
 | `POST` | `/engine/sql` | Execute raw SQL directly against the database |
-| `POST` | `/engine/nlq` | English → Pure → SQL → results (full NLQ pipeline) |
+| `POST` | `/engine/nlq` | English → Pure → SQL → results (full NLQ pipeline, with graceful decline) |
 | `POST` | `/lsp` | LSP protocol — diagnostics, completions, hover |
 | `GET`  | `/health` | Health check → `{"status":"ok"}` |
 
@@ -272,6 +277,7 @@ curl -X POST http://localhost:8080/engine/nlq \
 | Pure Compatibility Tests (PCT) | Validates against FINOS Legend spec |
 | NLQ eval — cheatsheet (54 cases) | Recall 100%, Pass 98.1% |
 | NLQ eval — holdout (25 cases) | Recall 92%, Pass 88% |
+| NLQ pipeline unit tests | 12 tests (includes decline handling) |
 | ANTLR grammars | 25 files |
 | Expression types | 28 (sealed interface) |
 | Aggregate functions | 24 (single + bivariate) |
@@ -314,8 +320,8 @@ legend-intelligence/
 │   └── src/main/java/
 │       └── org/finos/legend/engine/nlq/
 │           ├── SemanticIndex.java   # TF-IDF retrieval (435 lines)
-│           ├── NlqService.java      # Single-call pipeline (265 lines)
-│           ├── NlqHttpServer.java   # HTTP endpoint (213 lines)
+│           ├── NlqService.java      # Single-call pipeline with decline support (290+ lines)
+│           ├── NlqHttpServer.java   # HTTP endpoint (215+ lines)
 │           ├── ModelSchemaExtractor.java  # Schema → compact context
 │           ├── AnthropicApiClient.java
 │           ├── AnthropicCliClient.java
