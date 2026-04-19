@@ -186,6 +186,10 @@ public class NlqHttpServer {
                 response.put("queryPlan", result.queryPlan());
                 response.put("retrievedClasses", result.retrievedClasses());
                 response.put("latencyMs", result.latencyMs());
+                response.put("cannotAnswer", result.cannotAnswer());
+                if (result.followUpQuestion() != null) {
+                    response.put("followUpQuestion", result.followUpQuestion());
+                }
 
                 if (result.validationError() != null) {
                     response.put("error", result.validationError());

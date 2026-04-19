@@ -57,6 +57,23 @@ public class NlqService {
             - WRONG: arithmetic in project like $h.marketValue / $h.shares  CORRECT: project raw columns separately
             - WRONG: filter after project using property names  CORRECT: post-project filter must use the projected alias names exactly
 
+            WHEN TO DECLINE:
+            If the question CANNOT be answered with the given data model, return:
+            {"cannotAnswer": true, "followUpQuestion": "A specific clarifying question"}
+
+            Decline ONLY when:
+            - Question asks about data clearly outside the model (wrong domain)
+            - Question is too vague to pick a single root class or meaningful projection — e.g. "Show the data", "Show the details", "What do we have?"
+            - Question requires a specific value the user didn't provide ("show me that order")
+            - Question requires computation Pure cannot express (predict, correlate, statistical functions like Sharpe ratio)
+
+            DO NOT decline when:
+            - Question is answerable even if imprecise — make a reasonable interpretation
+            - Question mentions a concept that maps to a class/property in the model
+            - You can construct any reasonable Pure query
+
+            When in doubt and the question mentions a specific entity or concept, GENERATE A QUERY — false declines are worse than imperfect queries. But if the question is maximally vague (no specific entity, table, or column mentioned), DECLINE and ask what data they want.
+
             EXAMPLES:
             {"rootClass":"etf::Fund","pureQuery":"etf::Fund.all()->project([f|$f.ticker,f|$f.aum],['ticker','aum'])->filter({row|$row.aum>100000})->sort(~aum->descending())->take(5)"}
             {"rootClass":"etf::Holding","pureQuery":"etf::Holding.all()->filter({h|$h.fund.ticker=='SPY'})->project([h|$h.security.ticker,h|$h.weight],['sec','weight'])->sort(~weight->descending())"}
@@ -128,6 +145,18 @@ public class NlqService {
                 System.out.printf("  [NlqService] attempt=%d llmCall=%dms%n", attempt, callMs);
                 System.out.flush();
 
+                // Check for decline response before normal parsing
+                if (extractBooleanField(response, "cannotAnswer")) {
+                    String followUp = null;
+                    try {
+                        followUp = extractJsonField(response, "followUpQuestion");
+                    } catch (Exception ignored) {
+                        followUp = "Could you provide more details?";
+                    }
+                    long elapsed = (System.nanoTime() - start) / 1_000_000;
+                    return NlqResult.decline(followUp, retrievedList, elapsed);
+                }
+
                 // Parse JSON response
                 try {
                     rootClass = extractJsonField(response, "rootClass");
@@ -164,7 +193,9 @@ public class NlqService {
                         false,
                         "Pure validation: " + lastParseError.getMessage(),
                         retrievedList,
-                        elapsed
+                        elapsed,
+                        false,
+                        null
                 );
             }
 
@@ -176,7 +207,9 @@ public class NlqService {
                     true,
                     null,
                     retrievedList,
-                    elapsed
+                    elapsed,
+                    false,
+                    null
             );
 
         } catch (Exception e) {
@@ -256,6 +289,16 @@ public class NlqService {
             s = s.replaceAll("^```[a-z]*\\n?", "").replaceAll("\\n?```$", "").strip();
         }
         return s;
+    }
+
+    private static boolean extractBooleanField(String json, String field) {
+        String cleaned = stripFences(json);
+        Pattern p = Pattern.compile("\"" + field + "\"\\s*:\\s*(true|false)");
+        Matcher m = p.matcher(cleaned);
+        if (m.find()) {
+            return Boolean.parseBoolean(m.group(1));
+        }
+        return false;
     }
 
     private static String simpleName(String qualifiedName) {

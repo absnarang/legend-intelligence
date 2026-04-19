@@ -128,6 +128,24 @@ class NlqPipelineTest {
                 "Should include Portfolio: " + result.retrievedClasses());
     }
 
+    @Test
+    @Order(6)
+    @DisplayName("Pipeline handles decline response (cannotAnswer: true)")
+    void testDeclineResponse() {
+        MockLlmClient mock = MockLlmClient.withResponses(
+                "{\"cannotAnswer\": true, \"followUpQuestion\": \"Which product are you referring to?\"}"
+        );
+
+        NlqService service = new NlqService(index, modelBuilder, mock);
+        NlqResult result = service.process("show me that order", null);
+
+        assertTrue(result.isValid(), "Decline should be marked as valid");
+        assertTrue(result.cannotAnswer(), "cannotAnswer should be true");
+        assertEquals("Which product are you referring to?", result.followUpQuestion());
+        assertNull(result.pureQuery(), "pureQuery should be null for decline");
+        assertEquals(1, mock.callCount(), "Should make exactly 1 LLM call");
+    }
+
     // ==================== MockLlmClient Tests ====================
 
     @Test
@@ -187,5 +205,22 @@ class NlqPipelineTest {
         assertEquals("something broke", result.validationError());
         assertEquals(List.of("Trade"), result.retrievedClasses());
         assertEquals(42, result.latencyMs());
+        assertFalse(result.cannotAnswer());
+        assertNull(result.followUpQuestion());
+    }
+
+    @Test
+    @Order(31)
+    @DisplayName("NlqResult.decline creates decline result")
+    void testNlqResultDecline() {
+        NlqResult result = NlqResult.decline("Which product?", List.of("Product"), 100);
+
+        assertTrue(result.isValid());
+        assertTrue(result.cannotAnswer());
+        assertEquals("Which product?", result.followUpQuestion());
+        assertNull(result.pureQuery());
+        assertNull(result.rootClass());
+        assertEquals(List.of("Product"), result.retrievedClasses());
+        assertEquals(100, result.latencyMs());
     }
 }
